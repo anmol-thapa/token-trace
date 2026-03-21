@@ -1,7 +1,7 @@
-const http = require('http')
-const https = require('https')
-const { insertEvent } = require('./db')
-const { calculateEmissions } = require('./emissions')
+import http from 'http'
+import https from 'https'
+import { insertEvent } from './db'
+import { calculateEmissions } from './emissions'
 
 const ANTHROPIC_HOST = 'api.anthropic.com'
 const OPENAI_HOST = 'api.openai.com'
@@ -192,4 +192,4 @@ function createProxyServer() {
   return server
 }
 
-module.exports = { createProxyServer, setEmitter, PROXY_PORT }
+export { createProxyServer, setEmitter, PROXY_PORT }

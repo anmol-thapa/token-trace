@@ -3,9 +3,9 @@
  * Stores events as newline-delimited JSON (NDJSON) for fast appends.
  * Reads the full file for queries (fine for hackathon scale).
  */
-const fs = require('fs')
-const path = require('path')
-const { app } = require('electron')
+import fs from 'fs'
+import path from 'path'
+import { app } from 'electron'
 
 let dbPath = null
 
@@ -94,4 +94,4 @@ function getRecentEvents(limit = 50) {
   return readAll().slice(-limit).reverse()
 }
 
-module.exports = { insertEvent, getStats, getDailyStats, getRecentEvents }
+export { insertEvent, getStats, getDailyStats, getRecentEvents }

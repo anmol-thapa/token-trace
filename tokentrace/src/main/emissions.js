@@ -68,4 +68,4 @@ function getGreenAlternative(model) {
   return null
 }
 
-module.exports = { calculateEmissions, getGreenAlternative, getModelKwh }
+export { calculateEmissions, getGreenAlternative, getModelKwh }

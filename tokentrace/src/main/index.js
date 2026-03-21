@@ -1,7 +1,7 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } = require('electron')
-const path = require('path')
-const { createProxyServer, setEmitter, PROXY_PORT } = require('./proxy')
-const { getStats, getDailyStats, getRecentEvents } = require('./db')
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron'
+import path from 'path'
+import { createProxyServer, setEmitter, PROXY_PORT } from './proxy'
+import { getStats, getDailyStats, getRecentEvents } from './db'
 
 let mainWindow = null
 let tray = null
