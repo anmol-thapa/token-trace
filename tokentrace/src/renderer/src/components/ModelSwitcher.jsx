@@ -1,8 +1,14 @@
+// Savings percentages derived from actual kWh/1K rates in emissions.js (tokens-methodology.md)
+// Opus→Haiku: (0.01013-0.00055)/0.01013 = 94.6%
+// Sonnet→Haiku: (0.00160-0.00055)/0.00160 = 65.6%
+// GPT-4/turbo→mini: (0.00120-0.00012)/0.00120 = 90%
+// GPT-4o→mini: (0.00060-0.00012)/0.00060 = 80%
 const ALTERNATIVES = {
-  'claude-opus': { alt: 'claude-haiku', saving: 87 },
-  'claude-sonnet': { alt: 'claude-haiku', saving: 80 },
-  'gpt-4': { alt: 'gpt-4o-mini', saving: 87 },
-  'gpt-4o': { alt: 'gpt-4o-mini', saving: 80 }
+  'claude-opus':   { alt: 'claude-haiku', saving: 95 },
+  'claude-sonnet': { alt: 'claude-haiku', saving: 66 },
+  'gpt-4-turbo':   { alt: 'gpt-4o-mini', saving: 90 },
+  'gpt-4o':        { alt: 'gpt-4o-mini', saving: 80 },
+  'gpt-4':         { alt: 'gpt-4o-mini', saving: 90 },
 }
 
 export default function ModelSwitcher({ byModel = [] }) {

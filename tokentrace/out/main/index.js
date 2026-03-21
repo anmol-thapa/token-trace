@@ -1,9 +1,11 @@
 "use strict";
 const electron = require("electron");
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const child_process = require("child_process");
 const http = require("http");
 const https = require("https");
-const fs = require("fs");
 let dbPath = null;
 function getDbPath() {
   if (!dbPath) dbPath = path.join(electron.app.getPath("userData"), "tokentrace.ndjson");
@@ -81,50 +83,72 @@ function getDailyStats({ days = 30 } = {}) {
 function getRecentEvents(limit = 50) {
   return readAll().slice(-limit).reverse();
 }
-const MODEL_PROFILES = [
-  // Anthropic
-  { prefix: "claude-opus", kwh: 4e-3 },
-  { prefix: "claude-sonnet", kwh: 15e-4 },
-  { prefix: "claude-haiku", kwh: 3e-4 },
-  { prefix: "claude-3-opus", kwh: 4e-3 },
-  { prefix: "claude-3-5-sonnet", kwh: 15e-4 },
-  { prefix: "claude-3-5-haiku", kwh: 3e-4 },
-  { prefix: "claude-3-sonnet", kwh: 15e-4 },
-  { prefix: "claude-3-haiku", kwh: 3e-4 },
-  // OpenAI
-  { prefix: "o3", kwh: 8e-3 },
-  { prefix: "o1", kwh: 4e-3 },
-  { prefix: "gpt-4o-mini", kwh: 3e-4 },
-  { prefix: "gpt-4o", kwh: 15e-4 },
-  { prefix: "gpt-4", kwh: 4e-3 },
-  { prefix: "gpt-3.5", kwh: 3e-4 }
-];
-const GRID_INTENSITY_G_PER_KWH = 386;
+const MODEL_KWH_PER_1K = {
+  // ── Anthropic Claude ──────────────────────────────────────────────────────
+  "claude-haiku-4": 55e-5,
+  "claude-3-5-haiku": 55e-5,
+  "claude-3-haiku": 55e-5,
+  "claude-haiku": 55e-5,
+  "claude-sonnet-4": 16e-4,
+  "claude-3-7-sonnet": 16e-4,
+  "claude-3-5-sonnet": 16e-4,
+  "claude-3-sonnet": 16e-4,
+  "claude-sonnet": 16e-4,
+  "claude-opus-4": 0.01013,
+  "claude-3-opus": 0.01013,
+  "claude-opus": 0.01013,
+  // ── OpenAI GPT ────────────────────────────────────────────────────────────
+  "gpt-4o-mini": 12e-5,
+  "gpt-4o": 6e-4,
+  "gpt-4-turbo": 12e-4,
+  "gpt-4": 12e-4,
+  "gpt-3.5-turbo": 2e-4,
+  "gpt-3.5": 2e-4,
+  // ── OpenAI reasoning models ───────────────────────────────────────────────
+  "o3-mini": 6e-4,
+  "o3": 24e-4,
+  "o1-mini": 6e-4,
+  "o1": 12e-4,
+  // ── Google Gemini ─────────────────────────────────────────────────────────
+  "gemini-2.5-pro": 8e-4,
+  "gemini-2.0-flash": 1e-4,
+  "gemini-1.5-flash": 12e-5,
+  "gemini-1.5-pro": 6e-4,
+  // ── GPT-5 Codex (OpenAI Codex CLI) ───────────────────────────────────────
+  "gpt-5": 6e-4,
+  // treat as GPT-4o tier until data available
+  // ── Fallback ──────────────────────────────────────────────────────────────
+  "default": 4e-4
+};
+const GRID_G_CO2_PER_KWH = 386;
 function getModelKwh(model) {
-  if (!model) return 1e-3;
-  const lower = model.toLowerCase();
-  for (const profile of MODEL_PROFILES) {
-    if (lower.startsWith(profile.prefix)) return profile.kwh;
+  if (!model || typeof model !== "string") return MODEL_KWH_PER_1K["default"];
+  const lower = model.toLowerCase().trim();
+  for (const key of Object.keys(MODEL_KWH_PER_1K)) {
+    if (key === "default") continue;
+    if (lower.startsWith(key) || lower.includes(key)) return MODEL_KWH_PER_1K[key];
   }
-  return 1e-3;
+  return MODEL_KWH_PER_1K["default"];
 }
 function calculateEmissions(model, inputTokens, outputTokens) {
   const modelKwh = getModelKwh(model);
-  const weightedTokens = inputTokens + outputTokens * 3;
+  const weightedTokens = (inputTokens || 0) + 3 * (outputTokens || 0);
   const energyKwh = weightedTokens / 1e3 * modelKwh;
-  const co2Grams = energyKwh * GRID_INTENSITY_G_PER_KWH;
+  const co2Grams = energyKwh * GRID_G_CO2_PER_KWH;
   const comparisons = {
-    // meters driven in an average car (~120 gCO₂/km)
-    carMeters: Math.round(co2Grams / 120 * 1e3),
-    // phone charge percentage points (~0.05 gCO₂/%)
-    phoneChargePercent: Math.round(co2Grams / 0.05),
-    // seconds of HD video streaming (~0.017 gCO₂/s)
-    videoSeconds: Math.round(co2Grams * 60),
-    // seconds for one tree to absorb this CO₂ (~57.5 g/day)
-    treeSeconds: Math.round(co2Grams / 57.5 * 86400)
+    // EPA: average car emits 0.12 kg CO₂/km → meters
+    carMeters: Math.round(co2Grams / 1e3 / 0.12 * 1e3),
+    // US DOE: smartphone charge ≈ 0.011 kg CO₂ → % of charge
+    phoneChargePercent: +(co2Grams / 1e3 / 0.011 * 100).toFixed(2),
+    // EPA: one tree absorbs ~21 kg CO₂/year = ~0.0575 kg/day → tree-days
+    treeDaysNeeded: +(co2Grams / 1e3 / 0.0575).toFixed(4),
+    // 60W bulb at 386 gCO₂/kWh → hours
+    lightbulbHours: +(co2Grams / 1e3 / 0.0232).toFixed(4)
   };
   return { energyKwh, co2Grams, comparisons, modelKwh };
 }
+const anthropicAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+const openaiAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 const ANTHROPIC_HOST = "api.anthropic.com";
 const OPENAI_HOST = "api.openai.com";
 const PROXY_PORT = 3001;
@@ -138,6 +162,7 @@ function detectProvider(req) {
   if (headerProvider === "openai") return "openai";
   if (req.url.startsWith("/messages") || req.url.startsWith("/v1/messages")) return "anthropic";
   if (req.url.startsWith("/chat/completions") || req.url.startsWith("/v1/chat/completions")) return "openai";
+  if (req.url.startsWith("/responses") || req.url.startsWith("/v1/responses")) return "openai";
   const auth = req.headers["authorization"] || "";
   const key = auth.replace(/^Bearer\s+/i, "");
   if (key.startsWith("sk-ant-")) return "anthropic";
@@ -162,10 +187,29 @@ function extractAnthropicTokens(buffer) {
       if (evt.type === "message_delta" && evt.usage) {
         outputTokens = evt.usage.output_tokens || 0;
       }
+      if ((evt.type === "response.completed" || evt.type === "response.done") && evt.response) {
+        model = evt.response.model || model;
+        inputTokens = evt.response.usage?.input_tokens || inputTokens;
+        outputTokens = evt.response.usage?.output_tokens || outputTokens;
+      }
+      if (evt.type === "response.created" && evt.response) {
+        model = evt.response.model || model;
+      }
       if (evt.usage && evt.model && !evt.type) {
         model = evt.model || "";
         inputTokens = evt.usage.input_tokens || 0;
         outputTokens = evt.usage.output_tokens || 0;
+      }
+    } catch (_) {
+    }
+  }
+  if (!inputTokens) {
+    try {
+      const parsed = JSON.parse(buffer.toString());
+      if (parsed.usage && parsed.model) {
+        model = parsed.model;
+        inputTokens = parsed.usage.input_tokens || 0;
+        outputTokens = parsed.usage.output_tokens || 0;
       }
     } catch (_) {
     }
@@ -183,10 +227,15 @@ function extractOpenAITokens(buffer) {
     if (raw === "[DONE]") continue;
     try {
       const evt = JSON.parse(raw);
-      model = model || evt.model || "";
+      model = model || evt.model || evt.response?.model || "";
       if (evt.usage) {
-        inputTokens = evt.usage.prompt_tokens || 0;
-        outputTokens = evt.usage.completion_tokens || 0;
+        inputTokens = evt.usage.prompt_tokens || evt.usage.input_tokens || 0;
+        outputTokens = evt.usage.completion_tokens || evt.usage.output_tokens || 0;
+      }
+      if (evt.type === "response.completed" && evt.response?.usage) {
+        model = evt.response.model || model;
+        inputTokens = evt.response.usage.input_tokens || 0;
+        outputTokens = evt.response.usage.output_tokens || 0;
       }
     } catch (_) {
     }
@@ -195,8 +244,8 @@ function extractOpenAITokens(buffer) {
     try {
       const parsed = JSON.parse(buffer.toString());
       model = parsed.model || "";
-      inputTokens = parsed.usage?.prompt_tokens || 0;
-      outputTokens = parsed.usage?.completion_tokens || 0;
+      inputTokens = parsed.usage?.prompt_tokens || parsed.usage?.input_tokens || 0;
+      outputTokens = parsed.usage?.completion_tokens || parsed.usage?.output_tokens || 0;
     } catch (_) {
     }
   }
@@ -219,11 +268,18 @@ function createProxyServer() {
     const provider = detectProvider(req);
     const upstreamHost = provider === "anthropic" ? ANTHROPIC_HOST : OPENAI_HOST;
     const sessionId = req.headers["x-session-id"] || null;
+    console.log(`[proxy] ${req.method} ${req.url} → ${upstreamHost} (provider: ${provider})`);
+    if (req.method === "GET" && req.url.startsWith("/responses")) {
+      const empty = JSON.stringify({ object: "list", data: [], has_more: false });
+      res.writeHead(200, { "content-type": "application/json", "content-length": empty.length });
+      res.end(empty);
+      return;
+    }
     const reqChunks = [];
     req.on("data", (chunk) => reqChunks.push(chunk));
     req.on("end", () => {
       let bodyBuf = Buffer.concat(reqChunks);
-      if (provider === "openai") {
+      if (provider === "openai" && req.url.includes("/chat/completions")) {
         try {
           const parsed = JSON.parse(bodyBuf.toString());
           if (parsed.stream) {
@@ -237,22 +293,46 @@ function createProxyServer() {
       upstreamHeaders["host"] = upstreamHost;
       delete upstreamHeaders["x-provider"];
       delete upstreamHeaders["x-session-id"];
-      upstreamHeaders["content-length"] = bodyBuf.length;
+      delete upstreamHeaders["accept-encoding"];
+      if (req.method === "GET" || req.method === "HEAD") {
+        delete upstreamHeaders["content-length"];
+        delete upstreamHeaders["content-type"];
+      } else {
+        upstreamHeaders["content-length"] = bodyBuf.length;
+      }
+      const upstreamPath = req.url.startsWith("/v1") ? req.url : "/v1" + req.url;
       const options = {
         hostname: upstreamHost,
         port: 443,
-        path: req.url,
+        path: upstreamPath,
         method: req.method,
-        headers: upstreamHeaders
+        headers: upstreamHeaders,
+        agent: provider === "anthropic" ? anthropicAgent : openaiAgent
       };
+      let keepaliveTimer = null;
+      const isStreaming = req.method === "POST" && (req.url.includes("responses") || req.url.includes("messages"));
+      if (isStreaming) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          "connection": "keep-alive"
+        });
+        keepaliveTimer = setInterval(() => {
+          if (!res.writableEnded) res.write(": keepalive\n\n");
+        }, 5e3);
+      }
       const upstreamReq = https.request(options, (upstreamRes) => {
-        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+        if (!isStreaming) res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
         const resChunks = [];
         upstreamRes.on("data", (chunk) => {
           res.write(chunk);
           resChunks.push(chunk);
         });
         upstreamRes.on("end", () => {
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
           res.end();
           const fullBuf = Buffer.concat(resChunks);
           const extract = provider === "anthropic" ? extractAnthropicTokens : extractOpenAITokens;
@@ -275,6 +355,92 @@ function createProxyServer() {
     console.log(`[tokentrace] proxy listening on http://127.0.0.1:${PROXY_PORT}`);
   });
   return server;
+}
+const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
+const CODEX_CONFIG_PATH = path.join(os.homedir(), ".codex", "config.toml");
+const PROXY_URL = `http://localhost:${PROXY_PORT}`;
+let PREFS_PATH = null;
+let PID_PATH = null;
+const DEFAULT_PREFS = { claudeCode: false, codex: false };
+function readPrefs() {
+  try {
+    return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_PATH, "utf8")) };
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
+}
+function writePrefs(prefs) {
+  fs.mkdirSync(path.dirname(PREFS_PATH), { recursive: true });
+  fs.writeFileSync(PREFS_PATH, JSON.stringify(prefs, null, 2));
+}
+function readClaudeSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function writeClaudeSettings(settings) {
+  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
+  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
+function applyClaudeCode() {
+  const settings = readClaudeSettings();
+  settings.env = { ...settings.env || {}, ANTHROPIC_BASE_URL: PROXY_URL };
+  writeClaudeSettings(settings);
+}
+function removeClaudeCode() {
+  const settings = readClaudeSettings();
+  if (settings.env) {
+    delete settings.env.ANTHROPIC_BASE_URL;
+    if (Object.keys(settings.env).length === 0) delete settings.env;
+  }
+  writeClaudeSettings(settings);
+}
+function getCodexBaseUrl() {
+  try {
+    const content = fs.readFileSync(CODEX_CONFIG_PATH, "utf8");
+    const match = content.match(/^openai_base_url\s*=\s*"([^"]+)"/m);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+function applyCodex() {
+  fs.mkdirSync(path.dirname(CODEX_CONFIG_PATH), { recursive: true });
+  let content = "";
+  try {
+    content = fs.readFileSync(CODEX_CONFIG_PATH, "utf8");
+  } catch {
+  }
+  if (/^openai_base_url\s*=/m.test(content)) {
+    content = content.replace(/^openai_base_url\s*=.*\n?/m, `openai_base_url = "${PROXY_URL}"
+`);
+  } else {
+    content = `openai_base_url = "${PROXY_URL}"
+` + (content ? "\n" + content : "");
+  }
+  if (/^\[shell_environment_policy\.set\]/m.test(content)) {
+    if (/^OPENAI_BASE_URL\s*=/m.test(content)) {
+      content = content.replace(/^OPENAI_BASE_URL\s*=.*/m, `OPENAI_BASE_URL = "${PROXY_URL}"`);
+    } else {
+      content = content.replace(
+        /^(\[shell_environment_policy\.set\])/m,
+        `$1
+OPENAI_BASE_URL = "${PROXY_URL}"`
+      );
+    }
+  }
+  fs.writeFileSync(CODEX_CONFIG_PATH, content);
+}
+function removeCodex() {
+  try {
+    let content = fs.readFileSync(CODEX_CONFIG_PATH, "utf8");
+    content = content.replace(/^openai_base_url\s*=.*\n?/m, "");
+    content = content.replace(/^OPENAI_BASE_URL\s*=.*\n?/m, "");
+    fs.writeFileSync(CODEX_CONFIG_PATH, content);
+  } catch {
+  }
 }
 let mainWindow = null;
 let tray = null;
@@ -309,27 +475,24 @@ function createWindow() {
 function createTray() {
   const icon = electron.nativeImage.createEmpty();
   tray = new electron.Tray(icon);
-  const updateMenu = () => {
-    tray.setContextMenu(electron.Menu.buildFromTemplate([
-      { label: "Open TokenTrace", click: () => {
-        mainWindow.show();
-        mainWindow.focus();
-      } },
-      { type: "separator" },
-      { label: `Proxy: localhost:${PROXY_PORT}`, enabled: false },
-      { type: "separator" },
-      { label: "Quit", click: () => {
-        electron.app.isQuiting = true;
-        electron.app.quit();
-      } }
-    ]));
-  };
+  tray.setContextMenu(electron.Menu.buildFromTemplate([
+    { label: "Open TokenTrace", click: () => {
+      mainWindow.show();
+      mainWindow.focus();
+    } },
+    { type: "separator" },
+    { label: `Proxy: localhost:${PROXY_PORT}`, enabled: false },
+    { type: "separator" },
+    { label: "Quit", click: () => {
+      electron.app.isQuiting = true;
+      electron.app.quit();
+    } }
+  ]));
   tray.setToolTip("TokenTrace");
   tray.on("click", () => {
     mainWindow.show();
     mainWindow.focus();
   });
-  updateMenu();
 }
 function registerIPC() {
   electron.ipcMain.handle("get-stats", (_e, opts) => getStats(opts));
@@ -337,11 +500,85 @@ function registerIPC() {
   electron.ipcMain.handle("get-events", (_e, limit) => getRecentEvents(limit));
   electron.ipcMain.handle("get-proxy-port", () => PROXY_PORT);
   electron.ipcMain.handle("open-external", (_e, url) => electron.shell.openExternal(url));
+  electron.ipcMain.handle("get-connection-status", () => {
+    const settings = readClaudeSettings();
+    const connected = settings?.env?.ANTHROPIC_BASE_URL === PROXY_URL;
+    return { connected, currentValue: settings?.env?.ANTHROPIC_BASE_URL ?? null };
+  });
+  electron.ipcMain.handle("get-codex-status", () => {
+    const current = getCodexBaseUrl();
+    return { connected: current === PROXY_URL, currentValue: current };
+  });
+  electron.ipcMain.handle("connect-claude-code", () => {
+    applyClaudeCode();
+    const prefs = readPrefs();
+    prefs.claudeCode = true;
+    writePrefs(prefs);
+    return { ok: true };
+  });
+  electron.ipcMain.handle("disconnect-claude-code", () => {
+    removeClaudeCode();
+    const prefs = readPrefs();
+    prefs.claudeCode = false;
+    writePrefs(prefs);
+    return { ok: true };
+  });
+  electron.ipcMain.handle("connect-codex", () => {
+    applyCodex();
+    const prefs = readPrefs();
+    prefs.codex = true;
+    writePrefs(prefs);
+    return { ok: true };
+  });
+  electron.ipcMain.handle("disconnect-codex", () => {
+    removeCodex();
+    const prefs = readPrefs();
+    prefs.codex = false;
+    writePrefs(prefs);
+    return { ok: true };
+  });
+  electron.ipcMain.handle(
+    "restart-claude-code",
+    () => new Promise((resolve) => child_process.exec('pkill -f "claude"', () => resolve({ ok: true })))
+  );
+  electron.ipcMain.handle(
+    "restart-codex",
+    () => new Promise((resolve) => child_process.exec('pkill -f "codex"', () => resolve({ ok: true })))
+  );
+  electron.ipcMain.handle("get-prefs", () => readPrefs());
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 electron.app.whenReady().then(() => {
+  const userData = electron.app.getPath("userData");
+  PREFS_PATH = path.join(userData, "connection-prefs.json");
+  PID_PATH = path.join(userData, "app.pid");
+  try {
+    const oldPid = parseInt(fs.readFileSync(PID_PATH, "utf8"));
+    if (!isProcessAlive(oldPid)) {
+      removeClaudeCode();
+      removeCodex();
+    }
+  } catch {
+  }
+  fs.writeFileSync(PID_PATH, String(process.pid));
   createWindow();
   createTray();
   registerIPC();
+  const prefs = readPrefs();
+  if (prefs.claudeCode) {
+    applyClaudeCode();
+    child_process.exec('pkill -f "claude"');
+  }
+  if (prefs.codex) {
+    applyCodex();
+  }
   createProxyServer();
   setEmitter((event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -358,6 +595,18 @@ electron.app.whenReady().then(() => {
 });
 electron.app.on("window-all-closed", () => {
 });
+function cleanup() {
+  removeClaudeCode();
+  removeCodex();
+  try {
+    if (PID_PATH) fs.unlinkSync(PID_PATH);
+  } catch {
+  }
+}
 electron.app.on("before-quit", () => {
   electron.app.isQuiting = true;
+  cleanup();
+  const prefs = readPrefs();
+  if (prefs.claudeCode) child_process.exec('pkill -f "claude"');
 });
+process.on("exit", cleanup);

@@ -1,5 +1,8 @@
 import http from 'http'
 import https from 'https'
+
+const anthropicAgent = new https.Agent({ keepAlive: true, maxSockets: 10 })
+const openaiAgent = new https.Agent({ keepAlive: true, maxSockets: 10 })
 import { insertEvent } from './db'
 import { calculateEmissions } from './emissions'
 
@@ -23,6 +26,7 @@ function detectProvider(req) {
   // 2. Request path
   if (req.url.startsWith('/messages') || req.url.startsWith('/v1/messages')) return 'anthropic'
   if (req.url.startsWith('/chat/completions') || req.url.startsWith('/v1/chat/completions')) return 'openai'
+  if (req.url.startsWith('/responses') || req.url.startsWith('/v1/responses')) return 'openai'
 
   // 3. API key prefix
   const auth = req.headers['authorization'] || ''
@@ -46,22 +50,44 @@ function extractAnthropicTokens(buffer) {
     if (raw === '[DONE]') continue
     try {
       const evt = JSON.parse(raw)
-      // message_start has input tokens + model
+      // Messages API: message_start has input tokens + model
       if (evt.type === 'message_start' && evt.message) {
         model = evt.message.model || ''
         inputTokens = evt.message.usage?.input_tokens || 0
       }
-      // message_delta has output tokens
+      // Messages API: message_delta has output tokens
       if (evt.type === 'message_delta' && evt.usage) {
         outputTokens = evt.usage.output_tokens || 0
       }
-      // Non-streaming response
+      // Responses API streaming: response.completed or response.created
+      if ((evt.type === 'response.completed' || evt.type === 'response.done') && evt.response) {
+        model = evt.response.model || model
+        inputTokens = evt.response.usage?.input_tokens || inputTokens
+        outputTokens = evt.response.usage?.output_tokens || outputTokens
+      }
+      // Responses API: delta events carry model
+      if (evt.type === 'response.created' && evt.response) {
+        model = evt.response.model || model
+      }
+      // Non-streaming response (Messages or Responses API)
       if (evt.usage && evt.model && !evt.type) {
         model = evt.model || ''
         inputTokens = evt.usage.input_tokens || 0
         outputTokens = evt.usage.output_tokens || 0
       }
     } catch (_) { /* not JSON, skip */ }
+  }
+
+  // Non-streaming Responses API JSON body
+  if (!inputTokens) {
+    try {
+      const parsed = JSON.parse(buffer.toString())
+      if (parsed.usage && parsed.model) {
+        model = parsed.model
+        inputTokens = parsed.usage.input_tokens || 0
+        outputTokens = parsed.usage.output_tokens || 0
+      }
+    } catch (_) { /* streaming, already handled */ }
   }
 
   return { inputTokens, outputTokens, model }
@@ -79,10 +105,17 @@ function extractOpenAITokens(buffer) {
     if (raw === '[DONE]') continue
     try {
       const evt = JSON.parse(raw)
-      model = model || evt.model || ''
+      model = model || evt.model || evt.response?.model || ''
+      // Chat Completions API
       if (evt.usage) {
-        inputTokens = evt.usage.prompt_tokens || 0
-        outputTokens = evt.usage.completion_tokens || 0
+        inputTokens = evt.usage.prompt_tokens || evt.usage.input_tokens || 0
+        outputTokens = evt.usage.completion_tokens || evt.usage.output_tokens || 0
+      }
+      // Responses API — usage is on the completed response object
+      if (evt.type === 'response.completed' && evt.response?.usage) {
+        model = evt.response.model || model
+        inputTokens = evt.response.usage.input_tokens || 0
+        outputTokens = evt.response.usage.output_tokens || 0
       }
     } catch (_) { /* skip */ }
   }
@@ -92,8 +125,8 @@ function extractOpenAITokens(buffer) {
     try {
       const parsed = JSON.parse(buffer.toString())
       model = parsed.model || ''
-      inputTokens = parsed.usage?.prompt_tokens || 0
-      outputTokens = parsed.usage?.completion_tokens || 0
+      inputTokens = parsed.usage?.prompt_tokens || parsed.usage?.input_tokens || 0
+      outputTokens = parsed.usage?.completion_tokens || parsed.usage?.output_tokens || 0
     } catch (_) { /* streaming, already handled */ }
   }
 
@@ -118,6 +151,17 @@ function createProxyServer() {
     const provider = detectProvider(req)
     const upstreamHost = provider === 'anthropic' ? ANTHROPIC_HOST : OPENAI_HOST
     const sessionId = req.headers['x-session-id'] || null
+    console.log(`[proxy] ${req.method} ${req.url} → ${upstreamHost} (provider: ${provider})`)
+
+    // Short-circuit GET /responses — Codex polls this to check for resumable sessions.
+    // It always fails through a proxy (no WebSocket support), causing the reconnect loop.
+    // Return empty list immediately so Codex skips session-resume and goes straight to POST.
+    if (req.method === 'GET' && req.url.startsWith('/responses')) {
+      const empty = JSON.stringify({ object: 'list', data: [], has_more: false })
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': empty.length })
+      res.end(empty)
+      return
+    }
 
     // Collect request body
     const reqChunks = []
@@ -125,8 +169,9 @@ function createProxyServer() {
     req.on('end', () => {
       let bodyBuf = Buffer.concat(reqChunks)
 
-      // For OpenAI streaming: inject stream_options to get usage in final chunk
-      if (provider === 'openai') {
+      // For Chat Completions streaming only: inject stream_options to get usage in final chunk
+      // (Responses API includes usage natively in response.completed — don't inject there)
+      if (provider === 'openai' && (req.url.includes('/chat/completions'))) {
         try {
           const parsed = JSON.parse(bodyBuf.toString())
           if (parsed.stream) {
@@ -141,21 +186,49 @@ function createProxyServer() {
       upstreamHeaders['host'] = upstreamHost
       delete upstreamHeaders['x-provider']
       delete upstreamHeaders['x-session-id']
-      upstreamHeaders['content-length'] = bodyBuf.length
+      // Force uncompressed response so we can parse the SSE text
+      delete upstreamHeaders['accept-encoding']
+      // Don't set Content-Length on GET/HEAD — some servers reject it
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        delete upstreamHeaders['content-length']
+        delete upstreamHeaders['content-type']
+      } else {
+        upstreamHeaders['content-length'] = bodyBuf.length
+      }
+
+      // Ensure /v1 prefix — SDK may omit it when base URL already contains /v1
+      const upstreamPath = req.url.startsWith('/v1') ? req.url : '/v1' + req.url
 
       const options = {
         hostname: upstreamHost,
         port: 443,
-        path: req.url,
+        path: upstreamPath,
         method: req.method,
-        headers: upstreamHeaders
+        headers: upstreamHeaders,
+        agent: provider === 'anthropic' ? anthropicAgent : openaiAgent
+      }
+
+      // For POST streaming (SSE) requests: send headers + keepalive comments immediately
+      // so Codex doesn't time out while waiting for upstream to start responding.
+      // SSE responses are always 200 text/event-stream, so this is safe.
+      let keepaliveTimer = null
+      const isStreaming = req.method === 'POST' &&
+        (req.url.includes('responses') || req.url.includes('messages'))
+      if (isStreaming) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          'connection': 'keep-alive'
+        })
+        keepaliveTimer = setInterval(() => {
+          if (!res.writableEnded) res.write(': keepalive\n\n')
+        }, 5000)
       }
 
       const upstreamReq = https.request(options, (upstreamRes) => {
-        // Forward status + headers to client immediately
-        res.writeHead(upstreamRes.statusCode, upstreamRes.headers)
+        // For non-streaming requests forward headers normally
+        if (!isStreaming) res.writeHead(upstreamRes.statusCode, upstreamRes.headers)
 
-        // Buffer chunks for token extraction while piping to client
         const resChunks = []
         upstreamRes.on('data', (chunk) => {
           res.write(chunk)
@@ -163,8 +236,8 @@ function createProxyServer() {
         })
 
         upstreamRes.on('end', () => {
+          if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null }
           res.end()
-          // Extract tokens after stream closes — never blocks the response
           const fullBuf = Buffer.concat(resChunks)
           const extract = provider === 'anthropic' ? extractAnthropicTokens : extractOpenAITokens
           const { inputTokens, outputTokens, model } = extract(fullBuf)

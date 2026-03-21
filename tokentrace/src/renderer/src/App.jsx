@@ -5,10 +5,12 @@ import ModelBreakdown from './components/ModelBreakdown'
 import EventFeed from './components/EventFeed'
 import ComparisonCard from './components/ComparisonCard'
 import ModelSwitcher from './components/ModelSwitcher'
+import ConnectionTab from './components/ConnectionTab'
 
 const POLL_MS = 5000
 
 export default function App() {
+  const [tab, setTab] = useState('dashboard')
   const [stats, setStats] = useState(null)
   const [daily, setDaily] = useState([])
   const [events, setEvents] = useState([])
@@ -67,46 +69,63 @@ export default function App() {
       <div className="flex-1 px-6 pb-6 space-y-4 overflow-auto">
         {/* Header */}
         <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-white flex items-center gap-2">
-              🌱 TokenTrace
-            </h1>
-            <p className="text-slate-400 text-sm mt-0.5">
-              Proxy active on{' '}
-              <code className="bg-slate-800 px-1.5 py-0.5 rounded text-green-400 text-xs">
-                http://localhost:{proxyPort}
-              </code>
-            </p>
-          </div>
-          <div className="text-right">
-            <div className="text-xs text-slate-500 uppercase tracking-wide">This session</div>
-            <div className="text-lg font-semibold text-green-400">
-              {sessionCo2.toFixed(2)} g CO₂
+          <h1 className="text-2xl font-bold text-white flex items-center gap-2">
+            🌱 TokenTrace
+          </h1>
+          {tab === 'dashboard' && (
+            <div className="text-right">
+              <div className="text-xs text-slate-500 uppercase tracking-wide">This session</div>
+              <div className="text-lg font-semibold text-green-400">
+                {sessionCo2.toFixed(2)} g CO₂
+              </div>
+              <div className="text-xs text-slate-400">{sessionTokens.toLocaleString()} tokens</div>
             </div>
-            <div className="text-xs text-slate-400">{sessionTokens.toLocaleString()} tokens</div>
-          </div>
+          )}
         </div>
 
-        <SessionBar stats={stats} sessionCo2={sessionCo2} sessionTokens={sessionTokens} />
-
-        <div className="grid grid-cols-3 gap-4">
-          <div className="col-span-2">
-            <DailyChart data={daily} />
-          </div>
-          <div className="space-y-4">
-            <ComparisonCard stats={stats} />
-            <ModelSwitcher byModel={stats?.byModel} />
-          </div>
+        {/* Tabs */}
+        <div className="flex gap-1 bg-slate-800 rounded-lg p-1 w-fit">
+          {[['dashboard', 'Dashboard'], ['connection', 'Connection']].map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                tab === id
+                  ? 'bg-slate-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        <div className="grid grid-cols-3 gap-4">
-          <div className="col-span-1">
-            <ModelBreakdown byModel={stats?.byModel} />
-          </div>
-          <div className="col-span-2">
-            <EventFeed events={events} />
-          </div>
-        </div>
+        {tab === 'dashboard' && (
+          <>
+            <SessionBar stats={stats} sessionCo2={sessionCo2} sessionTokens={sessionTokens} />
+
+            <div className="grid grid-cols-3 gap-4">
+              <div className="col-span-2">
+                <DailyChart data={daily} />
+              </div>
+              <div className="space-y-4">
+                <ComparisonCard stats={stats} />
+                <ModelSwitcher byModel={stats?.byModel} />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-4">
+              <div className="col-span-1">
+                <ModelBreakdown byModel={stats?.byModel} />
+              </div>
+              <div className="col-span-2">
+                <EventFeed events={events} />
+              </div>
+            </div>
+          </>
+        )}
+
+        {tab === 'connection' && <ConnectionTab proxyPort={proxyPort} />}
       </div>
     </div>
   )

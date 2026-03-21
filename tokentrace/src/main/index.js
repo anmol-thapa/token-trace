@@ -1,7 +1,97 @@
 import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron'
 import path from 'path'
+import fs from 'fs'
+import os from 'os'
+import { exec } from 'child_process'
 import { createProxyServer, setEmitter, PROXY_PORT } from './proxy'
 import { getStats, getDailyStats, getRecentEvents } from './db'
+
+const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json')
+const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml')
+const PROXY_URL = `http://localhost:${PROXY_PORT}`
+
+// --- Prefs + PID file (persisted across launches) ---
+let PREFS_PATH = null
+let PID_PATH = null
+const DEFAULT_PREFS = { claudeCode: false, codex: false }
+
+function readPrefs() {
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_PATH, 'utf8')) } }
+  catch { return { ...DEFAULT_PREFS } }
+}
+
+function writePrefs(prefs) {
+  fs.mkdirSync(path.dirname(PREFS_PATH), { recursive: true })
+  fs.writeFileSync(PREFS_PATH, JSON.stringify(prefs, null, 2))
+}
+
+// --- Claude Code config ---
+function readClaudeSettings() {
+  try { return JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')) }
+  catch { return {} }
+}
+
+function writeClaudeSettings(settings) {
+  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true })
+  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2))
+}
+
+function applyClaudeCode() {
+  const settings = readClaudeSettings()
+  settings.env = { ...(settings.env || {}), ANTHROPIC_BASE_URL: PROXY_URL }
+  writeClaudeSettings(settings)
+}
+
+function removeClaudeCode() {
+  const settings = readClaudeSettings()
+  if (settings.env) {
+    delete settings.env.ANTHROPIC_BASE_URL
+    if (Object.keys(settings.env).length === 0) delete settings.env
+  }
+  writeClaudeSettings(settings)
+}
+
+// --- Codex config ---
+function getCodexBaseUrl() {
+  try {
+    const content = fs.readFileSync(CODEX_CONFIG_PATH, 'utf8')
+    const match = content.match(/^openai_base_url\s*=\s*"([^"]+)"/m)
+    return match ? match[1] : null
+  } catch { return null }
+}
+
+function applyCodex() {
+  fs.mkdirSync(path.dirname(CODEX_CONFIG_PATH), { recursive: true })
+  let content = ''
+  try { content = fs.readFileSync(CODEX_CONFIG_PATH, 'utf8') } catch { /* new file */ }
+
+  if (/^openai_base_url\s*=/m.test(content)) {
+    content = content.replace(/^openai_base_url\s*=.*\n?/m, `openai_base_url = "${PROXY_URL}"\n`)
+  } else {
+    content = `openai_base_url = "${PROXY_URL}"\n` + (content ? '\n' + content : '')
+  }
+
+  if (/^\[shell_environment_policy\.set\]/m.test(content)) {
+    if (/^OPENAI_BASE_URL\s*=/m.test(content)) {
+      content = content.replace(/^OPENAI_BASE_URL\s*=.*/m, `OPENAI_BASE_URL = "${PROXY_URL}"`)
+    } else {
+      content = content.replace(
+        /^(\[shell_environment_policy\.set\])/m,
+        `$1\nOPENAI_BASE_URL = "${PROXY_URL}"`
+      )
+    }
+  }
+  fs.writeFileSync(CODEX_CONFIG_PATH, content)
+}
+
+function removeCodex() {
+  try {
+    let content = fs.readFileSync(CODEX_CONFIG_PATH, 'utf8')
+    content = content.replace(/^openai_base_url\s*=.*\n?/m, '')
+    content = content.replace(/^OPENAI_BASE_URL\s*=.*\n?/m, '')
+    fs.writeFileSync(CODEX_CONFIG_PATH, content)
+  } catch { /* file doesn't exist */ }
+}
 
 let mainWindow = null
 let tray = null
@@ -30,7 +120,6 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
 
-  // Hide to tray instead of quitting
   mainWindow.on('close', (e) => {
     if (!app.isQuiting) {
       e.preventDefault()
@@ -40,23 +129,17 @@ function createWindow() {
 }
 
 function createTray() {
-  // Use a simple template image; replace with real icon in resources/
   const icon = nativeImage.createEmpty()
   tray = new Tray(icon)
-
-  const updateMenu = () => {
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: 'Open TokenTrace', click: () => { mainWindow.show(); mainWindow.focus() } },
-      { type: 'separator' },
-      { label: `Proxy: localhost:${PROXY_PORT}`, enabled: false },
-      { type: 'separator' },
-      { label: 'Quit', click: () => { app.isQuiting = true; app.quit() } }
-    ]))
-  }
-
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open TokenTrace', click: () => { mainWindow.show(); mainWindow.focus() } },
+    { type: 'separator' },
+    { label: `Proxy: localhost:${PROXY_PORT}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { app.isQuiting = true; app.quit() } }
+  ]))
   tray.setToolTip('TokenTrace')
   tray.on('click', () => { mainWindow.show(); mainWindow.focus() })
-  updateMenu()
 }
 
 function registerIPC() {
@@ -65,14 +148,82 @@ function registerIPC() {
   ipcMain.handle('get-events', (_e, limit) => getRecentEvents(limit))
   ipcMain.handle('get-proxy-port', () => PROXY_PORT)
   ipcMain.handle('open-external', (_e, url) => shell.openExternal(url))
+
+  // Connection status
+  ipcMain.handle('get-connection-status', () => {
+    const settings = readClaudeSettings()
+    const connected = settings?.env?.ANTHROPIC_BASE_URL === PROXY_URL
+    return { connected, currentValue: settings?.env?.ANTHROPIC_BASE_URL ?? null }
+  })
+  ipcMain.handle('get-codex-status', () => {
+    const current = getCodexBaseUrl()
+    return { connected: current === PROXY_URL, currentValue: current }
+  })
+
+  // Connect / disconnect (also saves pref so app auto-reconnects on next launch)
+  ipcMain.handle('connect-claude-code', () => {
+    applyClaudeCode()
+    const prefs = readPrefs(); prefs.claudeCode = true; writePrefs(prefs)
+    return { ok: true }
+  })
+  ipcMain.handle('disconnect-claude-code', () => {
+    removeClaudeCode()
+    const prefs = readPrefs(); prefs.claudeCode = false; writePrefs(prefs)
+    return { ok: true }
+  })
+  ipcMain.handle('connect-codex', () => {
+    applyCodex()
+    const prefs = readPrefs(); prefs.codex = true; writePrefs(prefs)
+    return { ok: true }
+  })
+  ipcMain.handle('disconnect-codex', () => {
+    removeCodex()
+    const prefs = readPrefs(); prefs.codex = false; writePrefs(prefs)
+    return { ok: true }
+  })
+
+  // Restart helpers
+  ipcMain.handle('restart-claude-code', () =>
+    new Promise((resolve) => exec('pkill -f "claude"', () => resolve({ ok: true })))
+  )
+  ipcMain.handle('restart-codex', () =>
+    new Promise((resolve) => exec('pkill -f "codex"', () => resolve({ ok: true })))
+  )
+
+  ipcMain.handle('get-prefs', () => readPrefs())
+}
+
+function isProcessAlive(pid) {
+  try { process.kill(pid, 0); return true } catch { return false }
 }
 
 app.whenReady().then(() => {
+  const userData = app.getPath('userData')
+  PREFS_PATH = path.join(userData, 'connection-prefs.json')
+  PID_PATH = path.join(userData, 'app.pid')
+
+  // Crash recovery: if a stale PID file exists and that process is dead,
+  // the app was force-killed last time — clean up any leftover proxy URLs
+  try {
+    const oldPid = parseInt(fs.readFileSync(PID_PATH, 'utf8'))
+    if (!isProcessAlive(oldPid)) {
+      removeClaudeCode()
+      removeCodex()
+    }
+  } catch { /* no PID file = clean first launch */ }
+
+  // Write current PID so we can detect crashes on next launch
+  fs.writeFileSync(PID_PATH, String(process.pid))
+
   createWindow()
   createTray()
   registerIPC()
 
-  // Start proxy; wire emitter so new events push to renderer via IPC
+  // Auto-reconnect: re-apply proxy URLs for tools that were connected last session
+  const prefs = readPrefs()
+  if (prefs.claudeCode) { applyClaudeCode(); exec('pkill -f "claude"') }
+  if (prefs.codex) { applyCodex() } // don't kill codex — it crashes on SIGTERM
+
   createProxyServer()
   setEmitter((event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -87,9 +238,21 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  // Keep app alive in tray on all platforms
+  // Keep alive in tray
 })
+
+function cleanup() {
+  removeClaudeCode()
+  removeCodex()
+  try { if (PID_PATH) fs.unlinkSync(PID_PATH) } catch { /* ignore */ }
+}
 
 app.on('before-quit', () => {
   app.isQuiting = true
+  cleanup()
+  const prefs = readPrefs()
+  if (prefs.claudeCode) exec('pkill -f "claude"')
 })
+
+// Last-resort: fires even on SIGTERM / force kill
+process.on('exit', cleanup)

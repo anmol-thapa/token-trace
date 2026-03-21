@@ -1,4 +1,4 @@
-# 🌱 TokenTrace — Hackathon Build Plan
+# 🌱 TokenTrace — Build Plan (Live)
 **Sustainability + AI Track**
 
 ---
@@ -14,25 +14,29 @@ TokenTrace is a provider-agnostic middleware layer that sits between any LLM CLI
 - No existing tool tracks emissions across multiple providers in one place
 - Developers have no feedback loop on the environmental cost of their prompts
 - Switching to a smaller model (e.g. Haiku vs. Opus) can reduce emissions 15x, but nobody knows this in practice
+- AI coding agents silently send 10–12k tokens of system prompt + tool definitions on **every single request**, independent of conversation length — users have no visibility into this waste
 
 ### Solution
 - An Electron desktop app that runs a local proxy server in the background
 - Intercepts API calls from Claude Code, Codex CLI, and any SDK-based app
-- Extracts token counts from every request/response (including streaming)
+- One-click connection UI writes config directly into `~/.claude/settings.json` and `~/.codex/config.toml`
+- Extracts token counts from every request/response (including streaming SSE)
 - Calculates CO₂ emissions using per-model energy profiles and grid carbon intensity
-- Stores everything in a local SQLite database
+- Stores everything in a local NDJSON database
 - Displays live stats, charts, and offset guidance in the Electron window
+- Automatically detaches from tools when the app closes so they continue working uninterrupted
 
 ### Scope — What Is and Isn't Tracked
 
 | Client | Tracked? | How |
 |---|---|---|
-| Claude Code | ✅ Yes | `claude config set api-base-url http://localhost:3001` |
-| Codex CLI | ✅ Yes | `export OPENAI_BASE_URL=http://localhost:3001` |
+| Claude Code CLI | ✅ Yes | `ANTHROPIC_BASE_URL` written to `~/.claude/settings.json` |
+| Codex CLI (API key mode) | ✅ Yes | `openai_base_url` written to `~/.codex/config.toml` |
 | Custom app (Anthropic SDK) | ✅ Yes | `baseURL: 'http://localhost:3001'` in client config |
 | Custom app (OpenAI SDK) | ✅ Yes | `baseURL: 'http://localhost:3001'` in client config |
-| claude.ai (browser) | ❌ No | API calls happen server-side — not interceptable |
-| ChatGPT (browser) | ❌ No | API calls happen server-side — not interceptable |
+| Claude macOS desktop app | ❌ No | Connects to claude.ai via OAuth — not the Anthropic API |
+| Codex CLI (ChatGPT subscription) | ❌ No | OAuth token lacks `api.responses.write` scope when routed through proxy |
+| claude.ai / ChatGPT (browser) | ❌ No | API calls happen server-side — not interceptable |
 
 ---
 
@@ -49,22 +53,23 @@ Claude Code / Codex CLI / SDK App
 |                                       |
 |   Main Process (Node.js)              |
 |   +---------------------------------+ |
-|   |       Proxy Server              | |
+|   |       Proxy Server :3001        | |
 |   |  1. Detect provider             | |
-|   |  2. Forward to upstream API     | |
-|   |  3. Stream response to client   | |
-|   |  4. Extract token usage         | |
-|   |  5. Calculate CO₂               | |
-|   |  6. Write to SQLite DB          | |
+|   |  2. Short-circuit GET /responses| |
+|   |  3. Forward to upstream API     | |
+|   |  4. Stream response to client   | |
+|   |  5. Extract token usage (SSE)   | |
+|   |  6. Calculate CO₂               | |
+|   |  7. Write to NDJSON DB          | |
 |   +---------------------------------+ |
 |                                       |
 |   Renderer Process (React)            |
 |   +---------------------------------+ |
-|   |       Dashboard Window          | |
+|   |   Dashboard + Connection Tabs   | |
 |   |  - Live token + CO₂ feed        | |
 |   |  - Historical charts            | |
 |   |  - Model breakdown              | |
-|   |  - Offset suggestions           | |
+|   |  - One-click connect/disconnect | |
 |   +---------------------------------+ |
 +---------------------------------------+
           |               |
@@ -75,44 +80,56 @@ Claude Code / Codex CLI / SDK App
 
 | Process | Responsibilities |
 |---|---|
-| **Main process** | Starts proxy server, manages SQLite DB, exposes stats via IPC, system tray icon |
-| **Renderer process** | React dashboard, reads stats via IPC, displays charts and live feed |
+| **Main process** | Proxy server, NDJSON DB, IPC handlers, config read/write for Claude Code + Codex, system tray, lifecycle cleanup |
+| **Renderer process** | React dashboard + connection tab, reads stats via IPC, displays charts and live feed |
 
 ### Provider Detection Logic
 
 The proxy auto-detects which provider to forward to, in priority order:
 1. `X-Provider` request header (explicit override)
-2. Request path: `/messages` → Anthropic, `/chat/completions` → OpenAI
+2. Request path: `/messages` → Anthropic, `/chat/completions` or `/responses` → OpenAI
 3. API key prefix: `sk-ant-` → Anthropic, `sk-` → OpenAI
 
 ### Streaming Architecture
 
-Claude Code and Codex CLI both use streaming by default. The proxy handles this with a pipe-through pattern:
+Claude Code uses the Messages API and Codex uses the Responses API — both streaming over SSE. The proxy handles this with a pipe-through pattern:
 
-- Chunks are piped to the client **immediately** as they arrive — zero buffering, zero added latency
-- Each chunk is simultaneously scanned for token usage metadata
-- **Anthropic:** tokens appear in `message_start` and `message_delta` SSE events
-- **OpenAI:** `stream_options: { include_usage: true }` is injected automatically; tokens appear in the final chunk
-- Usage is logged to SQLite after the stream closes (non-blocking)
+- For POST streaming requests, `200 text/event-stream` headers are sent **immediately** before the upstream responds, preventing client timeouts while the model cold-starts
+- SSE keepalive comments (`: keepalive\n\n`) are injected every 5 seconds to keep the HTTP/1.1 connection alive
+- Chunks are piped to the client **immediately** as they arrive — zero added latency
+- Each chunk is simultaneously buffered for token extraction
+- **Anthropic Messages API:** tokens in `message_start` (input) and `message_delta` (output) SSE events
+- **OpenAI Responses API:** tokens in `response.completed` SSE event under `response.usage`
+- **OpenAI Chat Completions:** `stream_options: { include_usage: true }` injected automatically; tokens in final chunk
+- Usage is logged after the stream closes (non-blocking)
+
+### Key Proxy Implementation Details
+
+- `Accept-Encoding` is stripped from upstream requests — Anthropic/OpenAI compress SSE by default, which makes token extraction impossible
+- `/v1` prefix is added to paths that omit it (Codex sends `/responses`, API expects `/v1/responses`)
+- `Content-Length` and `Content-Type` are not set on GET/HEAD requests (some APIs reject them)
+- **GET /responses is short-circuited** — returns empty list immediately without hitting OpenAI. Codex polls this on session start to check for resumable sessions; when it goes through the proxy it fails/hangs, causing a 2-minute reconnect loop. The empty response makes Codex skip session-resume and go straight to POST
+- HTTPS keep-alive agents (`https.Agent({ keepAlive: true })`) reuse connections per provider to avoid repeated TLS handshakes
+- `stream_options.include_usage` is only injected for Chat Completions — the Responses API doesn't support it and returns 400 if it's present
 
 ---
 
 ## 3. Tech Stack
 
-| Component | Tech | Est. Time |
-|---|---|---|
-| Electron shell | Electron + electron-builder | 1 hr |
-| Proxy Server | Node.js + Express (main process) | 2 hrs |
-| Emissions Math | Custom JS module | 1 hr |
-| Database | SQLite (better-sqlite3) | 1 hr |
-| IPC / Stats bridge | Electron `ipcMain` / `ipcRenderer` | 1 hr |
-| React Dashboard | React + Recharts + Tailwind (renderer) | 4 hrs |
-| System tray + auto-start | Electron `Tray` API | 0.5 hr |
-| Demo setup | Configured clients + live data | 1 hr |
+| Component | Tech |
+|---|---|
+| Electron shell | Electron + electron-builder |
+| Proxy Server | Node.js `http` / `https` modules (main process) |
+| Emissions Math | Custom JS module |
+| Database | NDJSON file (newline-delimited JSON, no native deps) |
+| IPC / Stats bridge | Electron `ipcMain` / `ipcRenderer` |
+| React Dashboard | React + Recharts + Tailwind (renderer) |
+| System tray | Electron `Tray` API |
+| Build tool | electron-vite + Vite |
 
 ### Why These Choices
 - **Electron** — proxy is already Node.js; runs natively in the main process with zero extra overhead. Single distributable app, no terminal required.
-- **better-sqlite3** — synchronous SQLite with WAL mode, perfect for high-frequency writes from streaming responses
+- **NDJSON instead of SQLite** — avoids native binary compilation issues with Electron. Each event is a JSON line; query functions scan the file in memory.
 - **Recharts** — declarative charts that work out of the box with React state
 - **electron-builder** — packages the app as a `.dmg` (macOS) or `.exe` (Windows) for easy distribution
 
@@ -120,113 +137,121 @@ Claude Code and Codex CLI both use streaming by default. The proxy handles this 
 
 ## 4. Emissions Calculation
 
+Full methodology with citations: [tokens-methodology.md](tokens-methodology.md)
+
 ### Formula
 
 ```
-weighted_tokens = input_tokens + (output_tokens × 3)
-  # output tokens cost ~3x more (generation vs. prefill)
-
-energy_kwh = (weighted_tokens / 1000) × model_kwh_per_1k_tokens
-
-co2_grams = energy_kwh × grid_carbon_intensity_g_per_kwh
-  # US avg grid: 386 gCO₂/kWh (EPA 2023)
+co2Grams = (inputTokens + 3 × outputTokens) / 1000 × modelKwh × 386
 ```
 
-### Per-Model Energy Profiles
+- **3× output weighting:** Autoregressive decode generates one token per full forward pass (sequential). Prefill processes all input tokens in a single parallel pass. Özcan et al. (2025) Fig 3: decode-heavy workloads draw 2–4× more power than prefill-heavy at equivalent token counts. Samsi et al. (2023): LLaMA 65B costs 3–4 J per output token.
+- **386 gCO₂/kWh:** US EIA national average. Consistent with Luccioni et al. BLOOM (394), Li et al. HotCarbon (380), Özcan et al. CAISO (418).
 
-Energy estimates in kWh per 1K tokens, based on Patterson et al. 2021 and Luccioni et al. 2023:
+### Per-Model Energy Profiles (kWh per 1K output tokens)
 
-| Model | kWh / 1K tokens |
-|---|---|
-| claude-opus-4 / gpt-4 / o1 | 0.0030–0.0050 |
-| claude-sonnet / gpt-4o | 0.0010–0.0020 |
-| claude-haiku / gpt-4o-mini | 0.0002–0.0004 |
-| o3 (reasoning) | 0.0080 |
-| Default (unknown model) | 0.0010 |
+| Model | kWh/1K output tokens | Source |
+|---|---|---|
+| Claude Haiku (all generations) | 0.00055 | carboncredits.com: 0.22 Wh / ~400 tokens (directly measured) |
+| Claude Sonnet (all generations) | 0.00160 | Interpolated: ~3× Haiku via price ratio proxy |
+| Claude Opus (all generations) | 0.01013 | carboncredits.com: 4.05 Wh / ~400 tokens (directly measured) |
+| GPT-4o | 0.00060 | Epoch AI (2025): ~0.3 Wh / ~500 tokens; OpenAI: 0.34 Wh/query |
+| GPT-4o-mini | 0.00012 | Price ratio proxy: ~5× cheaper than GPT-4o |
+| GPT-4 / GPT-4-turbo | 0.00120 | ~2× GPT-4o (older architecture) |
+| GPT-3.5-turbo | 0.00020 | Highly optimized, long-deployed |
+| Gemini 2.5 Pro | 0.00080 | Price-tier proxy (premium) |
+| Gemini 1.5 Pro | 0.00060 | Price-tier proxy (GPT-4o comparable) |
+| Gemini Flash / 2.0 Flash | 0.00010–0.00012 | Price-tier proxy (mini tier) |
+| Default (unknown model) | 0.00040 | 0.4 J/token modern estimate (clune.org 2025) × 1.2 PUE |
+
+The difference between tiers is stark: Claude Opus uses **18× more energy** per token than Claude Haiku.
+
+### Uncertainty
+
+Estimates are shown with ±50% bounds:
+- **Lower bound (0.5×):** Renewable grid (35 gCO₂/kWh per Li et al.) + optimized batching
+- **Upper bound (2.5×):** Coal grid + unoptimized single-request serving + idle overhead (Luccioni: idle adds 46% on top of dynamic inference)
+
+### What Is Not Included
+
+- Embodied carbon from GPU manufacturing (~22% of lifecycle per Luccioni et al.)
+- Idle serving overhead
+- Prompt caching discounts (Anthropic cache reads cost ~10% of standard input rate)
+- Network transmission
 
 ### Human-Readable Comparisons
 
-Each calculation returns relatable comparisons for the dashboard:
-- **Car distance:** `co2_grams ÷ 120 g/km × 1000` = meters driven
-- **Phone charge:** `co2_grams ÷ 0.05 g/%` = phone charge percentage points
-- **Video streaming:** `co2_grams × 60` = seconds of HD video
-- **Tree offset:** `co2_grams ÷ 57.5 g/day × 86400` = seconds for one tree to absorb
+- **km driven:** `co2Kg / 0.12` (EPA: avg car emits 0.12 kg CO₂/km)
+- **phones charged:** `co2Kg / 0.011` (US DOE: smartphone charge ≈ 0.011 kg CO₂)
+- **tree-days to offset:** `co2Kg / 0.0575` (EPA: one tree absorbs ~21 kg CO₂/year)
+- **lightbulb hours:** `co2Kg / 0.0232` (60W bulb at 386 gCO₂/kWh)
 
 ---
 
-## 5. Component Breakdown
+## 5. Connection Management
 
-### 5.1 Electron Shell (`main.js`) 🔲 To Build
+### How Tools Are Connected
 
-- Creates the `BrowserWindow` for the dashboard
-- Starts the proxy server and SQLite DB on app launch
-- `Tray` icon — app stays alive when window is closed
-- `ipcMain` handlers expose stats and recent events to the renderer
-- `app.setLoginItem` for optional launch-at-login
+The Connection tab provides one-click connect/disconnect for each supported tool:
 
-### 5.2 Proxy Server (`proxy/index.js`) 🔲 To Build
+| Tool | Config file | Key written |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` | `env.ANTHROPIC_BASE_URL` |
+| Codex CLI | `~/.codex/config.toml` | `openai_base_url` (top-level) + `OPENAI_BASE_URL` in `[shell_environment_policy.set]` |
 
-- Accepts all HTTP methods on any path
-- Detects provider from path, API key prefix, or `X-Provider` header
-- Rebuilds request headers with correct upstream host
-- For OpenAI streaming: injects `stream_options` automatically
-- Pipes response chunks to client while extracting token metadata
-- Calls `logAndEmit()` after stream ends — never blocks the response
+`openai_base_url` must appear **before any `[section]` headers** in the TOML file or it gets parsed as part of that section.
 
-### 5.3 Emissions Module (`lib/emissions.js`) 🔲 To Build
+### Lifecycle
 
-- `MODEL_PROFILES` map: model name → kWh per 1K tokens
-- Prefix matching for versioned model names (e.g. `claude-3-5-sonnet-20241022`)
-- `calculateEmissions(model, inputTokens, outputTokens)` returns `energy_kwh`, `co2_grams`, `co2_comparisons`
-- Grid carbon intensity constant — can be made dynamic via ElectricityMaps API
+- **On connect:** writes proxy URL to config, shows "Restart Now" button to kill the tool process so it picks up the change
+- **On app quit (`before-quit`):** removes proxy URLs from all configs, kills Claude Code. Codex is not killed on quit — it crashes on SIGTERM instead of restarting gracefully.
+- **Crash recovery:** on launch, checks for a stale PID file. If the previous process is dead (force-killed), runs cleanup before re-applying
+- **Auto-reconnect:** on launch, re-applies proxy URLs for any tool that was connected last session (saved in `connection-prefs.json` in Electron userData)
+- `process.on('exit', cleanup)` runs as a last-resort hook
 
-### 5.4 Database (`db/index.js`) 🔲 To Build
+### Codex-Specific Notes
 
-- SQLite with WAL journal mode for concurrent read/write
-- `usage_events` table: provider, model, input/output/total tokens, CO₂, energy, session_id, timestamp
-- Indexes on timestamp, session_id, provider for fast dashboard queries
-- `getStats({ since, provider, session_id })` returns totals, byModel breakdown, byDay time series
-- `getRecentEvents(limit)` for live feed in dashboard
-
-### 5.5 React Dashboard (`renderer/`) 🔲 To Build
-
-- Session summary bar: tokens in / tokens out / total CO₂ this session
-- Historical line chart: daily CO₂ over last 30 days (Recharts `LineChart`)
-- Model breakdown pie chart: which model is producing most emissions
-- Relatable comparison card: "Today = driving X meters"
-- Offset suggestions panel: links to Wren, Terrapass; tree equivalents
-- Model switcher widget: "Switching to Haiku saves X g CO₂/day"
-- Live event feed: last N API calls with tokens + emissions
+- Codex crashes (SIGTERM) if killed via `pkill` — only Claude Code is auto-killed on reconnect/quit
+- Codex's session initialization involves multiple GET /responses calls that fail through the proxy, causing a 2-minute reconnect loop on every new conversation. This is solved by short-circuiting GET /responses at the proxy level.
+- Requires an OpenAI API key with `api.responses.write` scope explicitly enabled (new scope; old keys get 401)
 
 ---
 
-## 6. Build Timeline
+## 6. Key Findings from Testing
 
-Assumes a 24-hour hackathon with a 3-person team.
+### The Hidden Cost of AI Agents
 
-| Phase | Time | Tasks | Deliverable |
-|---|---|---|---|
-| Setup | Hour 0–2 | Repo, Electron shell, proxy skeleton, SQLite schema, tray icon | App launches, proxy running |
-| Core proxy | Hour 2–5 | Provider detection, forwarding, streaming pipe-through, token extraction | Tokens logging to DB |
-| Emissions | Hour 5–6 | emissions.js, model profiles, comparisons | CO₂ data in DB |
-| IPC bridge | Hour 6–7 | ipcMain stats handlers, renderer ipcRenderer calls | Dashboard can read DB |
-| Dashboard | Hour 7–12 | React app, Recharts charts, session bar, model breakdown, offset panel | Working dashboard in Electron |
-| Integration | Hour 12–16 | Connect all pieces, seed real data, test Claude Code + Codex end-to-end | Full demo flow |
-| Polish | Hour 16–20 | UI/UX, edge cases, error handling, model switcher widget | Demo-ready |
-| Pitch prep | Hour 20–24 | Slides, talking points, demo script, fallback screenshots | Presentation ready |
+A Codex session with 4 messages all saying "hi" shows **~12k input tokens per request**. The actual conversation is ~50 tokens. The rest is:
+- Large system prompt describing agent behavior and rules
+- Full JSON schemas for every tool (bash, file read/write, search, etc.)
+- Shell environment state, memory files, loaded rules
+
+This overhead is sent on **every single API call** regardless of message length. The API is stateless — there is no persistent context server-side.
+
+### The Stateless API Problem
+
+All major AI APIs are stateless. Every request resends the full conversation history:
+- Turn 1: system prompt + tools + 1 message
+- Turn 50: system prompt + tools + 50 messages
+
+Long agentic sessions compound this dramatically.
 
 ---
 
-## 7. Client Integration Guide
+## 7. Client Integration
 
 ### Claude Code
+Handled automatically via the Connection tab. Manually:
 ```bash
-claude config set api-base-url http://localhost:3001
+# In ~/.claude/settings.json
+{ "env": { "ANTHROPIC_BASE_URL": "http://localhost:3001" } }
 ```
 
-### OpenAI Codex CLI
-```bash
-export OPENAI_BASE_URL=http://localhost:3001
+### Codex CLI
+Handled automatically via the Connection tab. Manually:
+```toml
+# At the TOP of ~/.codex/config.toml (before any [section])
+openai_base_url = "http://localhost:3001"
 ```
 
 ### OpenAI SDK
@@ -245,31 +270,24 @@ const client = new Anthropic({ baseURL: 'http://localhost:3001' })
 
 ## 8. Stretch Goals
 
-In priority order — tackle these if you finish early:
-
-**1. Real-time WebSocket / IPC push updates**
-- Emit an IPC event from proxy on every `logAndEmit()` call
-- Dashboard updates charts live without polling
+**1. HTTP/2 upstream connections**
+- Node.js `http2` module for multiplexed connections to api.openai.com / api.anthropic.com
+- Would eliminate the per-request TLS handshake overhead and match direct connection performance
 
 **2. Dynamic grid carbon intensity via ElectricityMaps API**
-- `GET https://api.electricitymap.org/v3/carbon-intensity/latest?zone=US-NY`
-- Swap the hardcoded 386 gCO₂/kWh constant with live regional data
+- Swap the hardcoded 386 gCO₂/kWh with live regional data
 
 **3. Model recommendation engine**
-- Analyze last 7 days of usage and suggest cheaper/greener models
-- "Your prompts average 200 tokens. Haiku would save 87% CO₂ at same quality"
+- Analyze last 7 days and suggest cheaper/greener models
 
 **4. Per-project / per-session tagging**
-- `X-Session-ID` header support in the proxy
-- UI to name sessions and compare project footprints
+- `X-Session-ID` header support, UI to name sessions
 
 **5. Carbon offset purchase flow**
-- Integrate Wren or Terrapass API to calculate and initiate offset purchases
-- "You've offset X kg CO₂ this month" badge
+- Integrate Wren or Terrapass API
 
 **6. Export & sharing**
-- CSV/JSON export of usage history
-- Shareable link showing your monthly emissions report
+- CSV/JSON export, shareable monthly report
 
 ---
 
@@ -277,43 +295,31 @@ In priority order — tackle these if you finish early:
 
 ### Demo Flow
 
-1. Launch the TokenTrace app — proxy starts automatically, tray icon appears
-2. Run `claude config set api-base-url http://localhost:3001` in terminal
-3. Run a real Claude Code session — generate some code, ask follow-up questions
-4. Click the tray icon to open the dashboard — show it updating live with token counts and CO₂
-5. Point to model breakdown: "That session used Opus. Here's what it cost in carbon"
-6. Click the model switcher: "Switching to Haiku for tasks like this saves 87% CO₂"
-7. Show offset panel: "One tree for 3 minutes would offset that session"
+1. Launch TokenTrace — proxy starts, tray icon appears
+2. Open Connection tab — click Connect for Claude Code, click Restart Now
+3. Run a Claude Code session (this very conversation works as a demo)
+4. Switch to Dashboard tab — show live token counts and CO₂ updating in real time
+5. Point to the 12k token context window: "This is just the agent overhead, before you type anything"
+6. Show model breakdown: "Switching to Haiku for these tasks saves 87% CO₂"
 
 ### Judging Criteria Alignment
 
 | Criterion | How TokenTrace hits it |
 |---|---|
 | Sustainability impact | Direct measurement + offset pathway for AI's fastest-growing emission source |
-| AI integration | Native integration with Claude, OpenAI, Codex — works with any LLM tool |
-| Technical depth | Proxy architecture, streaming SSE parsing, per-model energy profiles, Electron IPC |
+| AI integration | Native one-click integration with Claude Code and Codex — works with any LLM tool |
+| Technical depth | Proxy architecture, SSE parsing for two different APIs, lifecycle management, streaming keepalives |
 | Novelty | No existing tool does provider-agnostic LLM carbon tracking as a native desktop app |
-| Demo-ability | Live terminal → desktop dashboard flow is visually compelling and reproducible |
+| Demo-ability | Live coding session → dashboard flow is visually compelling and reproducible |
 
 ### One-Sentence Answers to Hard Questions
 
-- **"Why a desktop app and not a web app?"** — The proxy needs to run persistently in the background; a native app with a tray icon is the natural fit and requires no terminal.
+- **"Why a desktop app and not a web app?"** — The proxy needs to run persistently in the background; a native app with a tray icon is the natural fit.
 - **"Why a proxy and not a plugin?"** — A proxy works for every client without any code changes, including CLI tools and third-party apps.
-- **"Are the emissions numbers accurate?"** — They're estimates based on published research (Luccioni 2023); we surface our methodology and error bars openly.
+- **"Are the emissions numbers accurate?"** — Estimates based on published research (Luccioni 2023); methodology is surfaced openly.
 - **"What about privacy?"** — Everything runs locally. No data leaves your machine except to the LLM APIs you're already calling.
-- **"How do you handle streaming?"** — We pipe chunks to the client instantly and extract token metadata from SSE events in parallel, so latency is unaffected.
-
----
-
-## 10. Open Questions & Decisions
-
-| Question | Recommendation |
-|---|---|
-| Electron IPC or local HTTP for dashboard data? | IPC — faster, no port conflicts, more native |
-| How to package SQLite with Electron? | better-sqlite3 with electron-rebuild in postinstall |
-| How do we handle HTTPS upstream? | Proxy uses Node `https` module — no SSL termination needed for local use |
-| What if the user's API key is on the client side? | Proxy passes `Authorization` header through unchanged; no key ever touches our code |
-| Anthropic streaming format changes? | Pin to current SSE format; add `X-Anthropic-Version` header passthrough |
+- **"Why does it not work with the Claude desktop app?"** — That app connects to claude.ai via OAuth, not the Anthropic API — there's no base URL to redirect.
+- **"What's that 12k token overhead?"** — That's the agent framework itself: system prompt, tool definitions, shell state. TokenTrace makes this invisible cost visible.
 
 ---
 
