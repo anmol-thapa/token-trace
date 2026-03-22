@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, Notification } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
@@ -328,6 +328,16 @@ app.whenReady().then(() => {
   const emitUsageEvent = (event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('usage-event', event)
+    }
+    if (event.compressionStats && Notification.isSupported()) {
+      const { originalChars, compressedChars } = event.compressionStats
+      const pct  = Math.round((1 - compressedChars / originalChars) * 100)
+      const saved = Math.ceil(originalChars / 4) - Math.ceil(compressedChars / 4)
+      new Notification({
+        title: '🌱 Prompt Compressed',
+        body: `↓${pct}% reduction · ~${saved} tokens saved`,
+        silent: true
+      }).show()
     }
   }
 

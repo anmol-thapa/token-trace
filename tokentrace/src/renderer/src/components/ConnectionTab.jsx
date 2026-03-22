@@ -118,8 +118,61 @@ const CompressIcon = () => (
   </svg>
 )
 
+function CompressionDetailModal({ event, onClose }) {
+  if (!event) return null
+  const { originalChars, compressedChars, originalText, compressedText } = event.compressionStats
+  const pct  = Math.round((1 - compressedChars / originalChars) * 100)
+  const orig = Math.ceil(originalChars / 4)
+  const comp = Math.ceil(compressedChars / 4)
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl border border-green-200 w-[720px] max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-green-100">
+          <div>
+            <div className="font-semibold text-gray-900">Compression Detail</div>
+            <div className="text-xs text-gray-400 mt-0.5">{event.model} · {new Date(event.timestamp).toLocaleTimeString()}</div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="bg-green-100 text-green-800 border border-green-200 text-sm font-semibold px-3 py-1 rounded-full">↓{pct}% · −{orig - comp} tokens</span>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-0 flex-1 overflow-hidden">
+          <div className="flex flex-col border-r border-green-100 overflow-hidden">
+            <div className="px-4 py-2 text-xs font-semibold text-gray-400 uppercase tracking-wide border-b border-green-50 bg-gray-50">
+              Original · ~{orig} tokens
+            </div>
+            <div className="p-4 text-sm text-gray-700 overflow-auto whitespace-pre-wrap leading-relaxed flex-1">
+              {originalText || <span className="text-gray-300 italic">Text not stored</span>}
+            </div>
+          </div>
+          <div className="flex flex-col overflow-hidden">
+            <div className="px-4 py-2 text-xs font-semibold text-green-700 uppercase tracking-wide border-b border-green-50 bg-green-50">
+              Compressed · ~{comp} tokens
+            </div>
+            <div className="p-4 text-sm text-gray-700 overflow-auto whitespace-pre-wrap leading-relaxed flex-1">
+              {compressedText || <span className="text-gray-300 italic">Text not stored</span>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function CompressionCard({ enabled, onToggle, events = [] }) {
+  const [selected, setSelected] = useState(null)
   const compressed = events.filter(e => e.compressionStats)
+
+  // Group events with the same original text into a single row (recursive subagent calls)
+  const grouped = compressed.reduce((acc, e) => {
+    const key = e.compressionStats.originalText || `${e.compressionStats.originalChars}-${e.timestamp}`
+    if (!acc[key]) acc[key] = { primary: e, extras: [] }
+    else acc[key].extras.push(e)
+    return acc
+  }, {})
+  const groupedRows = Object.values(grouped).sort((a, b) => b.primary.timestamp - a.primary.timestamp)
+
   const totalSaved = compressed.reduce((sum, e) => {
     const orig = Math.ceil(e.compressionStats.originalChars / 4)
     const comp = Math.ceil(e.compressionStats.compressedChars / 4)
@@ -127,6 +180,8 @@ export function CompressionCard({ enabled, onToggle, events = [] }) {
   }, 0)
 
   return (
+    <>
+    <CompressionDetailModal event={selected} onClose={() => setSelected(null)} />
     <div className="bg-white rounded-xl border border-green-200 overflow-hidden">
       <div className="p-5 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -178,15 +233,19 @@ export function CompressionCard({ enabled, onToggle, events = [] }) {
               <span className="text-right">Ratio</span>
             </div>
             <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-              {compressed.slice(0, 10).map((e, i) => {
+              {groupedRows.slice(0, 10).map(({ primary: e, extras }, i) => {
                 const orig = Math.ceil(e.compressionStats.originalChars / 4)
                 const comp = Math.ceil(e.compressionStats.compressedChars / 4)
                 const pct = Math.round((1 - e.compressionStats.compressedChars / e.compressionStats.originalChars) * 100)
                 const time = new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                const modelShort = (e.model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '')
+                const allModels = [e, ...extras].map(x => (x.model || '').replace('claude-', '').replace(/-\d{8}$/, ''))
                 return (
-                  <div key={i} className="grid text-xs bg-gray-50 rounded-lg px-3 py-2" style={{ gridTemplateColumns: '3.5rem 1fr 4.5rem 0.75rem 4rem 2.5rem 2.75rem', gap: '0 0.5rem', alignItems: 'center' }}>
+                  <div key={i} onClick={() => setSelected(e)} className="grid text-xs bg-gray-50 hover:bg-green-50 rounded-lg px-3 py-2 cursor-pointer transition-colors" style={{ gridTemplateColumns: '3.5rem 1fr 4.5rem 0.75rem 4rem 2.5rem 2.75rem', gap: '0 0.5rem', alignItems: 'center' }}>
                     <span className="text-gray-400 tabular-nums">{time}</span>
-                    <span className="text-gray-500 truncate">{e.model || 'unknown'}</span>
+                    <span className="text-gray-500 truncate" title={allModels.join(', ')}>
+                      {modelShort}{extras.length > 0 && <span className="ml-1 text-green-700 font-medium">+{extras.length}</span>}
+                    </span>
                     <span className="text-gray-500 text-right tabular-nums">~{orig} tok</span>
                     <span className="text-gray-400 text-center">→</span>
                     <span className="text-gray-700 tabular-nums">~{comp} tok</span>
@@ -200,6 +259,7 @@ export function CompressionCard({ enabled, onToggle, events = [] }) {
         )}
       </div>
     </div>
+    </>
   )
 }
 

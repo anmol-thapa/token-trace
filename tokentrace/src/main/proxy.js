@@ -32,47 +32,43 @@ function setCompressionEnabled(val) {
   compressionEnabled = val
 }
 
+function httpsPost(hostname, path, headers, body) {
+  return new Promise((resolve, reject) => {
+    const buf = Buffer.from(body)
+    const req = https.request({ hostname, port: 443, path, method: 'POST', headers: { ...headers, 'content-length': buf.length }, agent: hostname.includes('anthropic') ? anthropicAgent : openaiAgent }, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(Buffer.concat(chunks).toString()) }) }
+        catch (e) { reject(e) }
+      })
+    })
+    req.on('error', reject)
+    req.setTimeout(30000, () => { req.destroy(new Error('timeout')) })
+    req.write(buf)
+    req.end()
+  })
+}
+
 async function compressUserMessage(content, provider, apiKey) {
   console.log(`[compress] sending to ${provider}, keyLen=${apiKey?.length ?? 0}, contentLen=${content.length}`)
   try {
     if (provider === 'anthropic') {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1024,
-          system: COMPRESS_SYSTEM,
-          messages: [{ role: 'user', content }]
-        }),
-        signal: AbortSignal.timeout(30000)
-      })
-      const data = await res.json()
-      console.log(`[compress] anthropic response: status=${res.status} type=${data.type} resultLen=${data.content?.[0]?.text?.length ?? 'n/a'}`)
+      const { status, data } = await httpsPost(
+        'api.anthropic.com', '/v1/messages',
+        { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 1024, system: COMPRESS_SYSTEM, messages: [{ role: 'user', content }] })
+      )
+      console.log(`[compress] anthropic response: status=${status} resultLen=${data.content?.[0]?.text?.length ?? 'n/a'}`)
       if (data.error) console.error('[compress] anthropic api error:', JSON.stringify(data.error))
       return data.content?.[0]?.text || content
     } else if (provider === 'openai') {
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: COMPRESS_SYSTEM },
-            { role: 'user', content }
-          ]
-        }),
-        signal: AbortSignal.timeout(30000)
-      })
-      const data = await res.json()
-      console.log(`[compress] openai response: status=${res.status} resultLen=${data.choices?.[0]?.message?.content?.length ?? 'n/a'}`)
+      const { status, data } = await httpsPost(
+        'api.openai.com', '/v1/chat/completions',
+        { 'content-type': 'application/json', 'authorization': `Bearer ${apiKey}` },
+        JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'system', content: COMPRESS_SYSTEM }, { role: 'user', content }] })
+      )
+      console.log(`[compress] openai response: status=${status} resultLen=${data.choices?.[0]?.message?.content?.length ?? 'n/a'}`)
       if (data.error) console.error('[compress] openai api error:', JSON.stringify(data.error))
       return data.choices?.[0]?.message?.content || content
     }
@@ -262,7 +258,27 @@ function createProxyServer() {
       : provider === 'gemini' ? GEMINI_HOST
         : OPENAI_HOST
     const sessionId = req.headers['x-session-id'] || null
-    console.log(`[proxy] ${req.method} ${req.url} → ${upstreamHost} (provider: ${provider})`)
+    const isInternalCall = req.headers['x-tokentrace-skip'] === '1'
+    console.log(`[proxy] ${req.method} ${req.url} → ${upstreamHost} (provider: ${provider}) | ua=${req.headers['user-agent']?.slice(0,60)} origin=${req.socket?.remoteAddress}:${req.socket?.remotePort}`)
+
+    // Control endpoint — lets external scripts toggle compression without IPC
+    if (req.url === '/tokentrace/compression') {
+      const chunks = []
+      req.on('data', c => chunks.push(c))
+      req.on('end', () => {
+        try {
+          const { enabled } = JSON.parse(Buffer.concat(chunks).toString())
+          compressionEnabled = !!enabled
+          const body = JSON.stringify({ ok: true, compression: compressionEnabled })
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(body)
+        } catch {
+          res.writeHead(400)
+          res.end(JSON.stringify({ error: 'bad request' }))
+        }
+      })
+      return
+    }
 
     // Short-circuit GET /responses — Codex polls this to check for resumable sessions.
     // It always fails through a proxy (no WebSocket support), causing the reconnect loop.
@@ -281,10 +297,30 @@ function createProxyServer() {
       let bodyBuf = Buffer.concat(reqChunks)
       let compressionStats = null
 
+      // Skip compression and logging for our own internal Haiku/GPT-4o-mini calls
+      if (isInternalCall) {
+        // Forward directly — no compression, no logging
+        const upstreamHeaders = { ...req.headers }
+        upstreamHeaders['host'] = upstreamHost
+        delete upstreamHeaders['x-tokentrace-skip']
+        delete upstreamHeaders['accept-encoding']
+        upstreamHeaders['content-length'] = bodyBuf.length
+        const upstreamPath = (provider === 'gemini' || req.url.startsWith('/v1')) ? req.url : '/v1' + req.url
+        const upstreamReq = https.request({ hostname: upstreamHost, port: 443, path: upstreamPath, method: req.method, headers: upstreamHeaders, agent: provider === 'anthropic' ? anthropicAgent : openaiAgent }, (upstreamRes) => {
+          res.writeHead(upstreamRes.statusCode, upstreamRes.headers)
+          upstreamRes.pipe(res)
+        })
+        upstreamReq.on('error', () => { if (!res.headersSent) { res.writeHead(502); res.end() } })
+        upstreamReq.write(bodyBuf)
+        upstreamReq.end()
+        return
+      }
+
       // Compress long user messages if enabled (skips Gemini — different message schema)
       if (compressionEnabled && provider !== 'gemini' && req.method === 'POST') {
         try {
           const parsed = JSON.parse(bodyBuf.toString())
+          console.log(`[proxy] request model=${parsed.model} port=${req.socket?.remotePort}`)
 
           const messages = parsed.messages || []
           const lastUser = [...messages].reverse().find(m => m.role === 'user')
@@ -325,7 +361,7 @@ function createProxyServer() {
                 lastUser.content = compressed
               }
               bodyBuf = Buffer.from(JSON.stringify(parsed))
-              compressionStats = { originalChars: original.length, compressedChars: compressed.length }
+              compressionStats = { originalChars: original.length, compressedChars: compressed.length, originalText: original, compressedText: compressed }
               const origTokens = Math.ceil(original.length / 4)
               const compTokens = Math.ceil(compressed.length / 4)
               console.log([
@@ -387,10 +423,11 @@ function createProxyServer() {
       }
 
       let keepaliveTimer = null
+      let bodyStream = false
+      try { bodyStream = !!JSON.parse(bodyBuf.toString()).stream } catch (_) {}
       const isStreaming = req.method === 'POST' && (
-        req.url.includes('responses') ||
-        req.url.includes('messages') ||
-        req.url.includes('streamGenerateContent')
+        req.url.includes('streamGenerateContent') || // Gemini always streams by URL
+        bodyStream // Anthropic/OpenAI: only if client explicitly set stream:true
       )
       if (isStreaming) {
         res.writeHead(200, {

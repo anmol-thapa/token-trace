@@ -4,6 +4,7 @@ import DailyChart from './components/DailyChart'
 import EventFeed from './components/EventFeed'
 import ImpactTab from './components/ImpactTab'
 import ConnectionTab, { CompressionCard } from './components/ConnectionTab'
+import { DEMO_DATASETS } from './demoData'
 
 const POLL_MS = 5000
 
@@ -16,6 +17,12 @@ export default function App() {
   const [sessionCo2, setSessionCo2] = useState(0)
   const [sessionTokens, setSessionTokens] = useState(0)
   const [compressionEnabled, setCompressionEnabled] = useState(false)
+  const [dataSource, setDataSource] = useState('live')
+
+  const activeDataset = dataSource === 'live' ? null : DEMO_DATASETS.find(d => d.id === dataSource)
+  const displayEvents = activeDataset ? activeDataset.events : events
+  const displayStats  = activeDataset ? activeDataset.stats  : stats
+  const displayDaily  = activeDataset ? activeDataset.daily  : daily
 
   const refresh = useCallback(async () => {
     const [s, d, e] = await Promise.all([
@@ -68,10 +75,25 @@ export default function App() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-bold text-gray-900">🌱 TokenTrace</h1>
-          <div className="text-right">
-            <div className="text-xs text-green-600 uppercase tracking-wide">This session</div>
-            <div className="text-lg font-semibold text-gray-900">{sessionCo2.toFixed(2)} g CO₂</div>
-            <div className="text-xs text-green-600">{sessionTokens.toLocaleString()} tokens</div>
+          <div className="flex items-center gap-4">
+            {/* Data source selector */}
+            <div className="flex items-center gap-2">
+              <select
+                value={dataSource}
+                onChange={e => setDataSource(e.target.value)}
+                className="text-xs border border-green-200 rounded-lg px-2.5 py-1.5 bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-400 cursor-pointer"
+              >
+                <option value="live">🔴 Live</option>
+                {DEMO_DATASETS.map(d => (
+                  <option key={d.id} value={d.id}>▶ {d.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="text-right">
+              <div className="text-xs text-green-600 uppercase tracking-wide">This session</div>
+              <div className="text-lg font-semibold text-gray-900">{sessionCo2.toFixed(2)} g CO₂</div>
+              <div className="text-xs text-green-600">{sessionTokens.toLocaleString()} tokens</div>
+            </div>
           </div>
         </div>
 
@@ -91,10 +113,10 @@ export default function App() {
 
         {tab === 'dashboard' && (
           <>
-            <SessionBar stats={stats} />
+            <SessionBar stats={displayStats} />
             <CompressionCard
               enabled={compressionEnabled}
-              events={events}
+              events={displayEvents}
               onToggle={async () => {
                 const next = !compressionEnabled
                 setCompressionEnabled(next)
@@ -102,14 +124,14 @@ export default function App() {
               }}
             />
             <div className="grid grid-cols-2 gap-4">
-              <DailyChart data={daily} />
-              <EventFeed events={events.slice(0, 50)} />
+              <DailyChart data={displayDaily} />
+              <EventFeed events={displayEvents.slice(0, 50)} />
             </div>
           </>
         )}
 
         {tab === 'impact' && (
-          <ImpactTab stats={stats} daily={daily} events={events} />
+          <ImpactTab stats={displayStats} daily={displayDaily} events={displayEvents} />
         )}
 
         {tab === 'connection' && <ConnectionTab proxyPort={proxyPort} />}
