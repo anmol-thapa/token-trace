@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 300px;
+      background: #0f172a;
+      color: #f1f5f9;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo {
+      width: 22px;
+      height: 22px;
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+    }
+    .title {
+      font-weight: 600;
+      font-size: 14px;
+      color: #f8fafc;
+    }
+    .version {
+      font-size: 10px;
+      color: #475569;
+    }
+
+    /* ── Section ── */
+    .section {
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .section:last-child { border-bottom: none; }
+    .section-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #475569;
+      margin-bottom: 8px;
+    }
+
+    /* ── Desktop connection ── */
+    .connection-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .connection-left {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-green  { background: #4ade80; box-shadow: 0 0 6px #4ade8088; }
+    .dot-gray   { background: #475569; }
+    .dot-pulse  { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    .connection-label {
+      color: #f1f5f9;
+      font-weight: 500;
+    }
+    .connection-label.dim { color: #64748b; }
+    .port-badge {
+      font-size: 10px;
+      color: #4ade80;
+      background: #14532d33;
+      border: 1px solid #166534aa;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .port-badge.dim {
+      color: #475569;
+      background: transparent;
+      border-color: #1e293b;
+    }
+
+    /* ── Stats grid ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-box {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 9px 11px;
+    }
+    .stat-value {
+      font-size: 16px;
+      font-weight: 700;
+      color: #f8fafc;
+      line-height: 1.2;
+    }
+    .stat-value.green { color: #4ade80; }
+    .stat-label {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    /* ── Site chip ── */
+    .site-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .site-chip {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    .site-chip.active {
+      border-color: #4ade8066;
+      color: #4ade80;
+      background: #14532d22;
+    }
+    .site-chip .dot { width: 5px; height: 5px; }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 10px 16px;
+      text-align: center;
+      font-size: 10px;
+      color: #334155;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">⚡</div>
+      <span class="title">TokenTrace</span>
+    </div>
+    <span class="version">v1.0.0</span>
+  </div>
+
+  <!-- Desktop App Connection -->
+  <div class="section">
+    <div class="section-label">Desktop App</div>
+    <div class="connection-row">
+      <div class="connection-left">
+        <div class="dot dot-gray dot-pulse" id="app-dot"></div>
+        <span class="connection-label dim" id="app-label">Checking...</span>
+      </div>
+      <span class="port-badge dim" id="app-port">:3002</span>
+    </div>
+  </div>
+
+  <!-- Session Stats -->
+  <div class="section">
+    <div class="section-label">Session Stats</div>
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-value" id="stat-tokens">—</div>
+        <div class="stat-label">tokens estimated</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value green" id="stat-co2">—</div>
+        <div class="stat-label">CO₂ emitted</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="stat-queries">—</div>
+        <div class="stat-label">responses tracked</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="stat-since">—</div>
+        <div class="stat-label">tracking since</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active Sites -->
+  <div class="section">
+    <div class="section-label">Coverage</div>
+    <div class="site-row">
+      <div class="site-chip" id="chip-claude">
+        <div class="dot dot-gray"></div>
+        claude.ai
+      </div>
+      <div class="site-chip" id="chip-chatgpt">
+        <div class="dot dot-gray"></div>
+        chatgpt.com
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">TokenTrace · HooHacks 2026</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
