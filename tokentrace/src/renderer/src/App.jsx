@@ -1,11 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import SessionBar from './components/SessionBar'
 import DailyChart from './components/DailyChart'
-import ModelBreakdown from './components/ModelBreakdown'
 import EventFeed from './components/EventFeed'
-import ComparisonCard from './components/ComparisonCard'
-import ModelSwitcher from './components/ModelSwitcher'
-import ConnectionTab from './components/ConnectionTab'
+import ImpactTab from './components/ImpactTab'
+import ConnectionTab, { CompressionCard } from './components/ConnectionTab'
 
 const POLL_MS = 5000
 
@@ -17,12 +15,13 @@ export default function App() {
   const [proxyPort, setProxyPort] = useState(3001)
   const [sessionCo2, setSessionCo2] = useState(0)
   const [sessionTokens, setSessionTokens] = useState(0)
+  const [compressionEnabled, setCompressionEnabled] = useState(false)
 
   const refresh = useCallback(async () => {
     const [s, d, e] = await Promise.all([
       window.api.getStats(),
       window.api.getDaily(),
-      window.api.getEvents(50)
+      window.api.getEvents(500)
     ])
     setStats(s)
     setDaily(d)
@@ -31,12 +30,12 @@ export default function App() {
 
   useEffect(() => {
     window.api.getProxyPort().then(setProxyPort)
+    window.api.getCompressionEnabled().then(v => setCompressionEnabled(!!v))
     refresh()
     const interval = setInterval(refresh, POLL_MS)
     return () => clearInterval(interval)
   }, [refresh])
 
-  // Live push from proxy
   useEffect(() => {
     const unsub = window.api.onUsageEvent((evt) => {
       setSessionCo2((prev) => prev + evt.co2Grams)
@@ -51,49 +50,39 @@ export default function App() {
           output_tokens: evt.outputTokens,
           total_tokens: evt.inputTokens + evt.outputTokens,
           co2_grams: evt.co2Grams,
-          energy_kwh: evt.energyKwh
+          energy_kwh: evt.energyKwh,
+          compressionStats: evt.compressionStats || null
         },
-        ...prev.slice(0, 49)
+        ...prev.slice(0, 499)
       ])
-      // Refresh totals after each event
       refresh()
     })
     return unsub
   }, [refresh])
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-200 flex flex-col">
-      {/* Title bar drag region */}
-      <div className="h-8 bg-slate-900" style={{ WebkitAppRegion: 'drag' }} />
+    <div className="min-h-screen bg-white text-gray-900 flex flex-col">
+      <div className="h-8 bg-white" style={{ WebkitAppRegion: 'drag' }} />
 
       <div className="flex-1 px-6 pb-6 space-y-4 overflow-auto">
         {/* Header */}
         <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold text-white flex items-center gap-2">
-            🌱 TokenTrace
-          </h1>
-          {tab === 'dashboard' && (
-            <div className="text-right">
-              <div className="text-xs text-slate-500 uppercase tracking-wide">This session</div>
-              <div className="text-lg font-semibold text-green-400">
-                {sessionCo2.toFixed(2)} g CO₂
-              </div>
-              <div className="text-xs text-slate-400">{sessionTokens.toLocaleString()} tokens</div>
-            </div>
-          )}
+          <h1 className="text-2xl font-bold text-gray-900">🌱 TokenTrace</h1>
+          <div className="text-right">
+            <div className="text-xs text-green-600 uppercase tracking-wide">This session</div>
+            <div className="text-lg font-semibold text-gray-900">{sessionCo2.toFixed(2)} g CO₂</div>
+            <div className="text-xs text-green-600">{sessionTokens.toLocaleString()} tokens</div>
+          </div>
         </div>
 
         {/* Tabs */}
-        <div className="flex gap-1 bg-slate-800 rounded-lg p-1 w-fit">
-          {[['dashboard', 'Dashboard'], ['connection', 'Connection']].map(([id, label]) => (
+        <div className="flex gap-1 bg-green-50 rounded-lg p-1 w-fit border border-green-200">
+          {[['dashboard', 'Dashboard'], ['impact', 'Impact'], ['connection', 'Connection']].map(([id, label]) => (
             <button
               key={id}
               onClick={() => setTab(id)}
-              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                tab === id
-                  ? 'bg-slate-600 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${tab === id ? 'bg-green-600 text-white' : 'text-green-700 hover:text-green-900'
+                }`}
             >
               {label}
             </button>
@@ -102,27 +91,25 @@ export default function App() {
 
         {tab === 'dashboard' && (
           <>
-            <SessionBar stats={stats} sessionCo2={sessionCo2} sessionTokens={sessionTokens} />
-
-            <div className="grid grid-cols-3 gap-4">
-              <div className="col-span-2">
-                <DailyChart data={daily} />
-              </div>
-              <div className="space-y-4">
-                <ComparisonCard stats={stats} />
-                <ModelSwitcher byModel={stats?.byModel} />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-4">
-              <div className="col-span-1">
-                <ModelBreakdown byModel={stats?.byModel} />
-              </div>
-              <div className="col-span-2">
-                <EventFeed events={events} />
-              </div>
+            <SessionBar stats={stats} />
+            <CompressionCard
+              enabled={compressionEnabled}
+              events={events}
+              onToggle={async () => {
+                const next = !compressionEnabled
+                setCompressionEnabled(next)
+                await window.api.setCompressionEnabled(next)
+              }}
+            />
+            <div className="grid grid-cols-2 gap-4">
+              <DailyChart data={daily} />
+              <EventFeed events={events.slice(0, 50)} />
             </div>
           </>
+        )}
+
+        {tab === 'impact' && (
+          <ImpactTab stats={stats} daily={daily} events={events} />
         )}
 
         {tab === 'connection' && <ConnectionTab proxyPort={proxyPort} />}

@@ -3,15 +3,15 @@ const electron = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const child_process = require("child_process");
 const http = require("http");
+const child_process = require("child_process");
 const https = require("https");
 let dbPath = null;
 function getDbPath() {
   if (!dbPath) dbPath = path.join(electron.app.getPath("userData"), "tokentrace.ndjson");
   return dbPath;
 }
-function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId }) {
+function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId, compressionStats }) {
   const row = {
     id: Date.now() + Math.random(),
     timestamp: Date.now(),
@@ -22,7 +22,8 @@ function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co
     total_tokens: inputTokens + outputTokens,
     energy_kwh: energyKwh,
     co2_grams: co2Grams,
-    session_id: sessionId || null
+    session_id: sessionId || null,
+    compressionStats: compressionStats || null
   };
   fs.appendFileSync(getDbPath(), JSON.stringify(row) + "\n", "utf8");
   return row;
@@ -72,7 +73,8 @@ function getDailyStats({ days = 30 } = {}) {
   const rows = readAll().filter((r) => r.timestamp >= since);
   const dayMap = {};
   for (const r of rows) {
-    const day = new Date(r.timestamp).toISOString().slice(0, 10);
+    const d = new Date(r.timestamp);
+    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     if (!dayMap[day]) dayMap[day] = { day, co2: 0, tokens: 0, calls: 0 };
     dayMap[day].co2 += r.co2_grams || 0;
     dayMap[day].tokens += r.total_tokens || 0;
@@ -149,12 +151,75 @@ function calculateEmissions(model, inputTokens, outputTokens) {
 }
 const anthropicAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 const openaiAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+const geminiAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 const ANTHROPIC_HOST = "api.anthropic.com";
 const OPENAI_HOST = "api.openai.com";
+const GEMINI_HOST = "generativelanguage.googleapis.com";
 const PROXY_PORT = 3001;
 let emitToRenderer = null;
+let compressionEnabled = false;
+const COMPRESS_THRESHOLD = 600;
+const COMPRESS_CEILING = 3e3;
+const COMPRESS_SYSTEM = `You are a prompt compressor. Rewrite the user message to be as concise as possible.
+Rules:
+1. NEVER modify technical content: code, commands, error messages, numbers, filenames, library names, URLs, version numbers, configs, stack traces, variable names, data structures
+2. REMOVE human conversational elements: greetings, hedging phrases ("I think", "maybe", "kind of"), narrative structure, politeness, repetition, and filler words
+3. KEEP all technical requirements, constraints, questions, and context
+4. Output ONLY the rewritten message — no preamble, no explanation`;
 function setEmitter(fn) {
   emitToRenderer = fn;
+}
+function setCompressionEnabled(val) {
+  compressionEnabled = val;
+}
+async function compressUserMessage(content, provider, apiKey) {
+  console.log(`[compress] sending to ${provider}, keyLen=${apiKey?.length ?? 0}, contentLen=${content.length}`);
+  try {
+    if (provider === "anthropic") {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          system: COMPRESS_SYSTEM,
+          messages: [{ role: "user", content }]
+        }),
+        signal: AbortSignal.timeout(3e4)
+      });
+      const data = await res.json();
+      console.log(`[compress] anthropic response: status=${res.status} type=${data.type} resultLen=${data.content?.[0]?.text?.length ?? "n/a"}`);
+      if (data.error) console.error("[compress] anthropic api error:", JSON.stringify(data.error));
+      return data.content?.[0]?.text || content;
+    } else if (provider === "openai") {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: COMPRESS_SYSTEM },
+            { role: "user", content }
+          ]
+        }),
+        signal: AbortSignal.timeout(3e4)
+      });
+      const data = await res.json();
+      console.log(`[compress] openai response: status=${res.status} resultLen=${data.choices?.[0]?.message?.content?.length ?? "n/a"}`);
+      if (data.error) console.error("[compress] openai api error:", JSON.stringify(data.error));
+      return data.choices?.[0]?.message?.content || content;
+    }
+  } catch (err) {
+    console.error("[compress] fetch error:", err.message);
+  }
+  return content;
 }
 function detectProvider(req) {
   const headerProvider = req.headers["x-provider"];
@@ -163,10 +228,13 @@ function detectProvider(req) {
   if (req.url.startsWith("/messages") || req.url.startsWith("/v1/messages")) return "anthropic";
   if (req.url.startsWith("/chat/completions") || req.url.startsWith("/v1/chat/completions")) return "openai";
   if (req.url.startsWith("/responses") || req.url.startsWith("/v1/responses")) return "openai";
+  if (req.url.includes("generateContent") || req.url.includes("streamGenerateContent") || req.url.startsWith("/v1beta/") || req.url.startsWith("/v1/models/")) return "gemini";
   const auth = req.headers["authorization"] || "";
   const key = auth.replace(/^Bearer\s+/i, "");
   if (key.startsWith("sk-ant-")) return "anthropic";
   if (key.startsWith("sk-")) return "openai";
+  const googleKey = req.headers["x-goog-api-key"] || "";
+  if (googleKey.startsWith("AIza")) return "gemini";
   return "anthropic";
 }
 function extractAnthropicTokens(buffer) {
@@ -251,13 +319,47 @@ function extractOpenAITokens(buffer) {
   }
   return { inputTokens, outputTokens, model };
 }
-function logAndEmit({ provider, model, inputTokens, outputTokens, sessionId }) {
+function extractGeminiTokens(buffer, reqUrl) {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let model = "";
+  const modelMatch = (reqUrl || "").match(/\/models\/([^/:?]+)/);
+  if (modelMatch) model = modelMatch[1];
+  const lines = buffer.toString().split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    const raw = line.slice(6).trim();
+    if (!raw || raw === "[DONE]") continue;
+    try {
+      const evt = JSON.parse(raw);
+      if (evt.usageMetadata) {
+        inputTokens = evt.usageMetadata.promptTokenCount || inputTokens;
+        outputTokens = evt.usageMetadata.candidatesTokenCount || outputTokens;
+        model = evt.modelVersion || model;
+      }
+    } catch (_) {
+    }
+  }
+  if (!inputTokens) {
+    try {
+      const parsed = JSON.parse(buffer.toString());
+      if (parsed.usageMetadata) {
+        inputTokens = parsed.usageMetadata.promptTokenCount || 0;
+        outputTokens = parsed.usageMetadata.candidatesTokenCount || 0;
+        model = parsed.modelVersion || model;
+      }
+    } catch (_) {
+    }
+  }
+  return { inputTokens, outputTokens, model };
+}
+function logAndEmit({ provider, model, inputTokens, outputTokens, sessionId, compressionStats }) {
   if (!inputTokens && !outputTokens) return;
   try {
     const { energyKwh, co2Grams, comparisons } = calculateEmissions(model, inputTokens, outputTokens);
-    insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId });
+    insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId, compressionStats });
     if (emitToRenderer) {
-      emitToRenderer({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, comparisons, timestamp: Date.now() });
+      emitToRenderer({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, comparisons, compressionStats, timestamp: Date.now() });
     }
   } catch (err) {
     console.error("[tokentrace] logAndEmit error:", err);
@@ -266,7 +368,7 @@ function logAndEmit({ provider, model, inputTokens, outputTokens, sessionId }) {
 function createProxyServer() {
   const server = http.createServer((req, res) => {
     const provider = detectProvider(req);
-    const upstreamHost = provider === "anthropic" ? ANTHROPIC_HOST : OPENAI_HOST;
+    const upstreamHost = provider === "anthropic" ? ANTHROPIC_HOST : provider === "gemini" ? GEMINI_HOST : OPENAI_HOST;
     const sessionId = req.headers["x-session-id"] || null;
     console.log(`[proxy] ${req.method} ${req.url} → ${upstreamHost} (provider: ${provider})`);
     if (req.method === "GET" && req.url.startsWith("/responses")) {
@@ -277,8 +379,56 @@ function createProxyServer() {
     }
     const reqChunks = [];
     req.on("data", (chunk) => reqChunks.push(chunk));
-    req.on("end", () => {
+    req.on("end", async () => {
       let bodyBuf = Buffer.concat(reqChunks);
+      let compressionStats = null;
+      if (compressionEnabled && provider !== "gemini" && req.method === "POST") {
+        try {
+          const parsed = JSON.parse(bodyBuf.toString());
+          const messages = parsed.messages || [];
+          const lastUser = [...messages].reverse().find((m) => m.role === "user");
+          let original = null;
+          let isArray = false;
+          let targetBlock = null;
+          if (lastUser) {
+            if (typeof lastUser.content === "string") {
+              original = lastUser.content;
+            } else if (Array.isArray(lastUser.content)) {
+              const textBlocks = lastUser.content.filter((b) => b.type === "text" && b.text);
+              if (textBlocks.length > 0) {
+                targetBlock = textBlocks[textBlocks.length - 1];
+                original = targetBlock.text;
+                isArray = true;
+              }
+            }
+          }
+          const hasInjectedContext = original && /<(system-reminder|ide_opened_file|ide_selection)\b/.test(original);
+          if (original && original.length > COMPRESS_THRESHOLD && original.length <= COMPRESS_CEILING && !hasInjectedContext) {
+            const apiKey = provider === "anthropic" ? req.headers["x-api-key"] || (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") : (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
+            const compressed = await compressUserMessage(original, provider, apiKey);
+            if (compressed && compressed !== original && compressed.length < original.length) {
+              if (isArray && targetBlock) {
+                targetBlock.text = compressed;
+              } else {
+                lastUser.content = compressed;
+              }
+              bodyBuf = Buffer.from(JSON.stringify(parsed));
+              compressionStats = { originalChars: original.length, compressedChars: compressed.length };
+              const origTokens = Math.ceil(original.length / 4);
+              const compTokens = Math.ceil(compressed.length / 4);
+              console.log([
+                "─".repeat(60),
+                `[compress] ${provider} · −${origTokens - compTokens} tokens (${Math.round((1 - compressed.length / original.length) * 100)}% reduction)`,
+                `  ORIGINAL  (~${origTokens} tok): ${original}`,
+                `  COMPRESSED (~${compTokens} tok): ${compressed}`,
+                "─".repeat(60)
+              ].join("\n"));
+            }
+          }
+        } catch (err) {
+          console.error("[compress] parse error:", err.message);
+        }
+      }
       if (provider === "openai" && req.url.includes("/chat/completions")) {
         try {
           const parsed = JSON.parse(bodyBuf.toString());
@@ -300,17 +450,17 @@ function createProxyServer() {
       } else {
         upstreamHeaders["content-length"] = bodyBuf.length;
       }
-      const upstreamPath = req.url.startsWith("/v1") ? req.url : "/v1" + req.url;
+      const upstreamPath = provider === "gemini" || req.url.startsWith("/v1") ? req.url : "/v1" + req.url;
       const options = {
         hostname: upstreamHost,
         port: 443,
         path: upstreamPath,
         method: req.method,
         headers: upstreamHeaders,
-        agent: provider === "anthropic" ? anthropicAgent : openaiAgent
+        agent: provider === "anthropic" ? anthropicAgent : provider === "gemini" ? geminiAgent : openaiAgent
       };
       let keepaliveTimer = null;
-      const isStreaming = req.method === "POST" && (req.url.includes("responses") || req.url.includes("messages"));
+      const isStreaming = req.method === "POST" && (req.url.includes("responses") || req.url.includes("messages") || req.url.includes("streamGenerateContent"));
       if (isStreaming) {
         res.writeHead(200, {
           "content-type": "text/event-stream",
@@ -335,9 +485,9 @@ function createProxyServer() {
           }
           res.end();
           const fullBuf = Buffer.concat(resChunks);
-          const extract = provider === "anthropic" ? extractAnthropicTokens : extractOpenAITokens;
+          const extract = provider === "anthropic" ? extractAnthropicTokens : provider === "gemini" ? (buf) => extractGeminiTokens(buf, req.url) : extractOpenAITokens;
           const { inputTokens, outputTokens, model } = extract(fullBuf);
-          logAndEmit({ provider, model, inputTokens, outputTokens, sessionId });
+          logAndEmit({ provider, model, inputTokens, outputTokens, sessionId, compressionStats });
         });
       });
       upstreamReq.on("error", (err) => {
@@ -356,12 +506,14 @@ function createProxyServer() {
   });
   return server;
 }
+const EXTENSION_PORT = 3002;
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
 const CODEX_CONFIG_PATH = path.join(os.homedir(), ".codex", "config.toml");
+const GEMINI_ENV_PATH = path.join(os.homedir(), ".env");
 const PROXY_URL = `http://localhost:${PROXY_PORT}`;
 let PREFS_PATH = null;
 let PID_PATH = null;
-const DEFAULT_PREFS = { claudeCode: false, codex: false };
+const DEFAULT_PREFS = { claudeCode: false, codex: false, gemini: false, compression: false };
 function readPrefs() {
   try {
     return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_PATH, "utf8")) };
@@ -433,6 +585,37 @@ OPENAI_BASE_URL = "${PROXY_URL}"`
   }
   fs.writeFileSync(CODEX_CONFIG_PATH, content);
 }
+function getGeminiBaseUrl() {
+  try {
+    const content = fs.readFileSync(GEMINI_ENV_PATH, "utf8");
+    const match = content.match(/^GEMINI_BASE_URL=(.+)$/m);
+    return match ? match[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+function applyGemini() {
+  let content = "";
+  try {
+    content = fs.readFileSync(GEMINI_ENV_PATH, "utf8");
+  } catch {
+  }
+  if (/^GEMINI_BASE_URL=/m.test(content)) {
+    content = content.replace(/^GEMINI_BASE_URL=.*/m, `GEMINI_BASE_URL=${PROXY_URL}`);
+  } else {
+    content = content.trimEnd() + (content ? "\n" : "") + `GEMINI_BASE_URL=${PROXY_URL}
+`;
+  }
+  fs.writeFileSync(GEMINI_ENV_PATH, content);
+}
+function removeGemini() {
+  try {
+    let content = fs.readFileSync(GEMINI_ENV_PATH, "utf8");
+    content = content.replace(/^GEMINI_BASE_URL=.*\n?/m, "");
+    fs.writeFileSync(GEMINI_ENV_PATH, content);
+  } catch {
+  }
+}
 function removeCodex() {
   try {
     let content = fs.readFileSync(CODEX_CONFIG_PATH, "utf8");
@@ -451,7 +634,7 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     titleBarStyle: "hiddenInset",
-    backgroundColor: "#0f172a",
+    backgroundColor: "#052e16",
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
@@ -537,6 +720,24 @@ function registerIPC() {
     writePrefs(prefs);
     return { ok: true };
   });
+  electron.ipcMain.handle("get-gemini-status", () => {
+    const current = getGeminiBaseUrl();
+    return { connected: current === PROXY_URL, currentValue: current };
+  });
+  electron.ipcMain.handle("connect-gemini", () => {
+    applyGemini();
+    const prefs = readPrefs();
+    prefs.gemini = true;
+    writePrefs(prefs);
+    return { ok: true };
+  });
+  electron.ipcMain.handle("disconnect-gemini", () => {
+    removeGemini();
+    const prefs = readPrefs();
+    prefs.gemini = false;
+    writePrefs(prefs);
+    return { ok: true };
+  });
   electron.ipcMain.handle(
     "restart-claude-code",
     () => new Promise((resolve) => child_process.exec('pkill -f "claude"', () => resolve({ ok: true })))
@@ -545,7 +746,19 @@ function registerIPC() {
     "restart-codex",
     () => new Promise((resolve) => child_process.exec('pkill -f "codex"', () => resolve({ ok: true })))
   );
+  electron.ipcMain.handle(
+    "restart-gemini",
+    () => new Promise((resolve) => child_process.exec('pkill -f "gemini"', () => resolve({ ok: true })))
+  );
   electron.ipcMain.handle("get-prefs", () => readPrefs());
+  electron.ipcMain.handle("get-compression-enabled", () => readPrefs().compression);
+  electron.ipcMain.handle("set-compression-enabled", (_e, val) => {
+    setCompressionEnabled(val);
+    const prefs = readPrefs();
+    prefs.compression = val;
+    writePrefs(prefs);
+    return { ok: true };
+  });
 }
 function isProcessAlive(pid) {
   try {
@@ -554,6 +767,46 @@ function isProcessAlive(pid) {
   } catch {
     return false;
   }
+}
+function startExtensionReceiver(emitFn) {
+  const server = http.createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.method === "POST" && req.url === "/event") {
+      let body = "";
+      req.on("data", (chunk) => body += chunk);
+      req.on("end", () => {
+        try {
+          const { provider, model, inputTokens, outputTokens } = JSON.parse(body);
+          if (inputTokens || outputTokens) {
+            const { energyKwh, co2Grams, comparisons } = calculateEmissions(model, inputTokens, outputTokens);
+            insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams });
+            if (emitFn) {
+              emitFn({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, comparisons, timestamp: Date.now() });
+            }
+          }
+          res.writeHead(200);
+          res.end("ok");
+        } catch (_) {
+          res.writeHead(400);
+          res.end("bad request");
+        }
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  server.listen(EXTENSION_PORT, "127.0.0.1", () => {
+    console.log(`[tokentrace] extension receiver on http://127.0.0.1:${EXTENSION_PORT}`);
+  });
+  return server;
 }
 electron.app.whenReady().then(() => {
   const userData = electron.app.getPath("userData");
@@ -564,6 +817,7 @@ electron.app.whenReady().then(() => {
     if (!isProcessAlive(oldPid)) {
       removeClaudeCode();
       removeCodex();
+      removeGemini();
     }
   } catch {
   }
@@ -579,12 +833,20 @@ electron.app.whenReady().then(() => {
   if (prefs.codex) {
     applyCodex();
   }
-  createProxyServer();
-  setEmitter((event) => {
+  if (prefs.gemini) {
+    applyGemini();
+  }
+  if (prefs.compression) {
+    setCompressionEnabled(true);
+  }
+  const emitUsageEvent = (event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("usage-event", event);
     }
-  });
+  };
+  createProxyServer();
+  setEmitter(emitUsageEvent);
+  startExtensionReceiver(emitUsageEvent);
   electron.app.on("activate", () => {
     if (electron.BrowserWindow.getAllWindows().length === 0) createWindow();
     else {
@@ -598,6 +860,7 @@ electron.app.on("window-all-closed", () => {
 function cleanup() {
   removeClaudeCode();
   removeCodex();
+  removeGemini();
   try {
     if (PID_PATH) fs.unlinkSync(PID_PATH);
   } catch {

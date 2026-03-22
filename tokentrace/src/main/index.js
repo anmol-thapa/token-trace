@@ -2,18 +2,23 @@ import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'ele
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
+import http from 'http'
 import { exec } from 'child_process'
-import { createProxyServer, setEmitter, PROXY_PORT } from './proxy'
-import { getStats, getDailyStats, getRecentEvents } from './db'
+import { createProxyServer, setEmitter, setCompressionEnabled, PROXY_PORT } from './proxy'
+import { getStats, getDailyStats, getRecentEvents, insertEvent } from './db'
+import { calculateEmissions } from './emissions'
+
+const EXTENSION_PORT = 3002
 
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json')
-const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml')
+const CODEX_CONFIG_PATH    = path.join(os.homedir(), '.codex', 'config.toml')
+const GEMINI_ENV_PATH      = path.join(os.homedir(), '.env')
 const PROXY_URL = `http://localhost:${PROXY_PORT}`
 
 // --- Prefs + PID file (persisted across launches) ---
 let PREFS_PATH = null
 let PID_PATH = null
-const DEFAULT_PREFS = { claudeCode: false, codex: false }
+const DEFAULT_PREFS = { claudeCode: false, codex: false, gemini: false, compression: false }
 
 function readPrefs() {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_PATH, 'utf8')) } }
@@ -84,6 +89,34 @@ function applyCodex() {
   fs.writeFileSync(CODEX_CONFIG_PATH, content)
 }
 
+// --- Gemini CLI config (~/.env) ---
+function getGeminiBaseUrl() {
+  try {
+    const content = fs.readFileSync(GEMINI_ENV_PATH, 'utf8')
+    const match = content.match(/^GEMINI_BASE_URL=(.+)$/m)
+    return match ? match[1].trim() : null
+  } catch { return null }
+}
+
+function applyGemini() {
+  let content = ''
+  try { content = fs.readFileSync(GEMINI_ENV_PATH, 'utf8') } catch { /* new file */ }
+  if (/^GEMINI_BASE_URL=/m.test(content)) {
+    content = content.replace(/^GEMINI_BASE_URL=.*/m, `GEMINI_BASE_URL=${PROXY_URL}`)
+  } else {
+    content = content.trimEnd() + (content ? '\n' : '') + `GEMINI_BASE_URL=${PROXY_URL}\n`
+  }
+  fs.writeFileSync(GEMINI_ENV_PATH, content)
+}
+
+function removeGemini() {
+  try {
+    let content = fs.readFileSync(GEMINI_ENV_PATH, 'utf8')
+    content = content.replace(/^GEMINI_BASE_URL=.*\n?/m, '')
+    fs.writeFileSync(GEMINI_ENV_PATH, content)
+  } catch { /* file doesn't exist */ }
+}
+
 function removeCodex() {
   try {
     let content = fs.readFileSync(CODEX_CONFIG_PATH, 'utf8')
@@ -103,7 +136,7 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     titleBarStyle: 'hiddenInset',
-    backgroundColor: '#0f172a',
+    backgroundColor: '#052e16',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
@@ -182,6 +215,21 @@ function registerIPC() {
     return { ok: true }
   })
 
+  ipcMain.handle('get-gemini-status', () => {
+    const current = getGeminiBaseUrl()
+    return { connected: current === PROXY_URL, currentValue: current }
+  })
+  ipcMain.handle('connect-gemini', () => {
+    applyGemini()
+    const prefs = readPrefs(); prefs.gemini = true; writePrefs(prefs)
+    return { ok: true }
+  })
+  ipcMain.handle('disconnect-gemini', () => {
+    removeGemini()
+    const prefs = readPrefs(); prefs.gemini = false; writePrefs(prefs)
+    return { ok: true }
+  })
+
   // Restart helpers
   ipcMain.handle('restart-claude-code', () =>
     new Promise((resolve) => exec('pkill -f "claude"', () => resolve({ ok: true })))
@@ -189,12 +237,62 @@ function registerIPC() {
   ipcMain.handle('restart-codex', () =>
     new Promise((resolve) => exec('pkill -f "codex"', () => resolve({ ok: true })))
   )
+  ipcMain.handle('restart-gemini', () =>
+    new Promise((resolve) => exec('pkill -f "gemini"', () => resolve({ ok: true })))
+  )
 
   ipcMain.handle('get-prefs', () => readPrefs())
+
+  ipcMain.handle('get-compression-enabled', () => readPrefs().compression)
+  ipcMain.handle('set-compression-enabled', (_e, val) => {
+    setCompressionEnabled(val)
+    const prefs = readPrefs(); prefs.compression = val; writePrefs(prefs)
+    return { ok: true }
+  })
 }
 
 function isProcessAlive(pid) {
   try { process.kill(pid, 0); return true } catch { return false }
+}
+
+// ── Extension receiver ────────────────────────────────────────────────────────
+// Listens on port 3002 for POST /event from the browser extension.
+// Accepts { provider, model, inputTokens, outputTokens } and feeds the event
+// into the same pipeline as proxy traffic (NDJSON log + renderer live update).
+function startExtensionReceiver(emitFn) {
+  const server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+
+    if (req.method === 'POST' && req.url === '/event') {
+      let body = ''
+      req.on('data', chunk => (body += chunk))
+      req.on('end', () => {
+        try {
+          const { provider, model, inputTokens, outputTokens } = JSON.parse(body)
+          if (inputTokens || outputTokens) {
+            const { energyKwh, co2Grams, comparisons } = calculateEmissions(model, inputTokens, outputTokens)
+            insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams })
+            if (emitFn) {
+              emitFn({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, comparisons, timestamp: Date.now() })
+            }
+          }
+          res.writeHead(200); res.end('ok')
+        } catch (_) { res.writeHead(400); res.end('bad request') }
+      })
+      return
+    }
+
+    res.writeHead(404); res.end()
+  })
+
+  server.listen(EXTENSION_PORT, '127.0.0.1', () => {
+    console.log(`[tokentrace] extension receiver on http://127.0.0.1:${EXTENSION_PORT}`)
+  })
+  return server
 }
 
 app.whenReady().then(() => {
@@ -209,6 +307,7 @@ app.whenReady().then(() => {
     if (!isProcessAlive(oldPid)) {
       removeClaudeCode()
       removeCodex()
+      removeGemini()
     }
   } catch { /* no PID file = clean first launch */ }
 
@@ -222,14 +321,19 @@ app.whenReady().then(() => {
   // Auto-reconnect: re-apply proxy URLs for tools that were connected last session
   const prefs = readPrefs()
   if (prefs.claudeCode) { applyClaudeCode(); exec('pkill -f "claude"') }
-  if (prefs.codex) { applyCodex() } // don't kill codex — it crashes on SIGTERM
+  if (prefs.codex) { applyCodex() }
+  if (prefs.gemini) { applyGemini() }
+  if (prefs.compression) { setCompressionEnabled(true) }
 
-  createProxyServer()
-  setEmitter((event) => {
+  const emitUsageEvent = (event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('usage-event', event)
     }
-  })
+  }
+
+  createProxyServer()
+  setEmitter(emitUsageEvent)
+  startExtensionReceiver(emitUsageEvent)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -244,6 +348,7 @@ app.on('window-all-closed', () => {
 function cleanup() {
   removeClaudeCode()
   removeCodex()
+  removeGemini()
   try { if (PID_PATH) fs.unlinkSync(PID_PATH) } catch { /* ignore */ }
 }
 

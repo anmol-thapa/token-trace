@@ -19,5 +19,11 @@ contextBridge.exposeInMainWorld('api', {
   connectCodex: () => ipcRenderer.invoke('connect-codex'),
   disconnectCodex: () => ipcRenderer.invoke('disconnect-codex'),
   restartCodex: () => ipcRenderer.invoke('restart-codex'),
+  getGeminiStatus: () => ipcRenderer.invoke('get-gemini-status'),
+  connectGemini: () => ipcRenderer.invoke('connect-gemini'),
+  disconnectGemini: () => ipcRenderer.invoke('disconnect-gemini'),
+  restartGemini: () => ipcRenderer.invoke('restart-gemini'),
   getPrefs: () => ipcRenderer.invoke('get-prefs'),
+  getCompressionEnabled: () => ipcRenderer.invoke('get-compression-enabled'),
+  setCompressionEnabled: (val) => ipcRenderer.invoke('set-compression-enabled', val),
 })

@@ -14,7 +14,7 @@ function getDbPath() {
   return dbPath
 }
 
-function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId }) {
+function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co2Grams, sessionId, compressionStats }) {
   const row = {
     id: Date.now() + Math.random(),
     timestamp: Date.now(),
@@ -25,7 +25,8 @@ function insertEvent({ provider, model, inputTokens, outputTokens, energyKwh, co
     total_tokens: inputTokens + outputTokens,
     energy_kwh: energyKwh,
     co2_grams: co2Grams,
-    session_id: sessionId || null
+    session_id: sessionId || null,
+    compressionStats: compressionStats || null
   }
   fs.appendFileSync(getDbPath(), JSON.stringify(row) + '\n', 'utf8')
   return row
@@ -80,7 +81,8 @@ function getDailyStats({ days = 30 } = {}) {
 
   const dayMap = {}
   for (const r of rows) {
-    const day = new Date(r.timestamp).toISOString().slice(0, 10)
+    const d = new Date(r.timestamp)
+    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
     if (!dayMap[day]) dayMap[day] = { day, co2: 0, tokens: 0, calls: 0 }
     dayMap[day].co2 += r.co2_grams || 0
     dayMap[day].tokens += r.total_tokens || 0
