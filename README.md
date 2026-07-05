@@ -88,3 +88,4 @@ The extension connects to the desktop app on `localhost:3002`. The desktop app m
 - macOS only. The app writes to `~/.claude/settings.json`, `~/.codex/config.toml`, and `~/.env` and uses `pkill` to restart CLI tools after config changes. These paths and commands are macOS/Linux specific.
 - No account or API key required. Everything is local.
 - The NDJSON database is stored in Electron's userData directory (`~/Library/Application Support/tokentrace/` on macOS).
+- Force-quitting the app (kill -9, crash) will leave proxy URLs set in your tool configs until the next launch, at which point the app detects the unclean exit and cleans them up automatically. In the meantime, your tools will get connection refused errors from the dead proxy.
